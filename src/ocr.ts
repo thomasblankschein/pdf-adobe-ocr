@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
   MimeType,
@@ -10,6 +11,7 @@ import {
   PDFServices,
   ServicePrincipalCredentials,
 } from "@adobe/pdfservices-node-sdk";
+import "./sdk-logging";
 
 export interface OcrOptions {
   locale: OCRSupportedLocale;
@@ -29,17 +31,13 @@ export function createClient(): PDFServices {
   });
 }
 
-/** Lädt ein PDF hoch, lässt es bei Adobe per OCR verarbeiten und schreibt das Ergebnis nach outputPath. */
-export async function ocrPdf(
+/** Lädt ein PDF-Stream hoch, lässt es bei Adobe per OCR verarbeiten und liefert das Ergebnis als Stream. */
+export async function ocrStream(
   pdfServices: PDFServices,
-  inputPath: string,
-  outputPath: string,
+  input: Readable,
   options: OcrOptions
-): Promise<void> {
-  const inputAsset = await pdfServices.upload({
-    readStream: fs.createReadStream(inputPath),
-    mimeType: MimeType.PDF,
-  });
+): Promise<NodeJS.ReadableStream> {
+  const inputAsset = await pdfServices.upload({ readStream: input, mimeType: MimeType.PDF });
 
   const job = new OCRJob({
     inputAsset,
@@ -49,11 +47,22 @@ export async function ocrPdf(
   const pollingURL = await pdfServices.submit({ job });
   const result = await pdfServices.getJobResult({ pollingURL, resultType: OCRResult });
   const content = await pdfServices.getContent({ asset: result.result!.asset });
+  return content.readStream;
+}
+
+/** Wie ocrStream, schreibt das Ergebnis aber nach outputPath. */
+export async function ocrPdf(
+  pdfServices: PDFServices,
+  inputPath: string,
+  outputPath: string,
+  options: OcrOptions
+): Promise<void> {
+  const result = await ocrStream(pdfServices, fs.createReadStream(inputPath), options);
 
   // Erst in eine Temp-Datei schreiben, damit bei Abbruch keine halbe PDF liegen bleibt.
   const tmpPath = `${outputPath}.part`;
   try {
-    await pipeline(content.readStream, fs.createWriteStream(tmpPath));
+    await pipeline(result, fs.createWriteStream(tmpPath));
     fs.renameSync(tmpPath, outputPath);
   } catch (err) {
     fs.rmSync(tmpPath, { force: true });

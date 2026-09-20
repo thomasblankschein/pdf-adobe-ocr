@@ -1,8 +1,9 @@
+import { OCRSupportedLocale, OCRSupportedType } from "@adobe/pdfservices-node-sdk";
 import fs from "node:fs";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { OCRSupportedLocale, OCRSupportedType } from "@adobe/pdfservices-node-sdk";
 import { createClient, ocrPdf } from "./ocr";
+import { DEFAULT_LANG, DEFAULT_TYPE, parseLocale, parseType } from "./options";
 
 try {
   process.loadEnvFile();
@@ -28,8 +29,8 @@ const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
     out: { type: "string", short: "o", default: "output" },
-    lang: { type: "string", short: "l", default: "de-DE" },
-    type: { type: "string", short: "t", default: "exact" },
+    lang: { type: "string", short: "l", default: DEFAULT_LANG },
+    type: { type: "string", short: "t", default: DEFAULT_TYPE },
     force: { type: "boolean", short: "f", default: false },
     help: { type: "boolean", short: "h", default: false },
   },
@@ -40,14 +41,13 @@ if (values.help || positionals.length !== 1) {
   process.exit(values.help ? 0 : 1);
 }
 
-const locale = Object.values(OCRSupportedLocale).find((l) => l === values.lang);
-if (!locale) fail(`Unbekannte Sprache "${values.lang}".`);
-const type =
-  values.type === "exact"
-    ? OCRSupportedType.SEARCHABLE_IMAGE_EXACT
-    : values.type === "deskew"
-      ? OCRSupportedType.SEARCHABLE_IMAGE
-      : fail(`Unbekannter Typ "${values.type}" (exact | deskew).`);
+let locale: OCRSupportedLocale, type: OCRSupportedType;
+try {
+  locale = parseLocale(values.lang!);
+  type = parseType(values.type!);
+} catch (err) {
+  fail((err as Error).message);
+}
 
 const target = path.resolve(positionals[0]);
 if (!fs.existsSync(target)) fail(`Nicht gefunden: ${target}`);
@@ -76,7 +76,7 @@ async function main() {
     }
     process.stdout.write(`… ${path.basename(input)} `);
     try {
-      await ocrPdf(client, input, outPath, { locale: locale!, type });
+      await ocrPdf(client, input, outPath, { locale, type });
       console.log("✓");
       ok++;
     } catch (err) {

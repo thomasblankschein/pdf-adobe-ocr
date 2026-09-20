@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF OCR – Test</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1c2330; --card:#fff; --line:#d8dde5; --accent:#2f5fd0; --err:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171c; --fg:#e6e9ef; --card:#1d2129; --line:#333a46; --accent:#6f95f5; --err:#f2827a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:1200px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:22px; margin:0 0 16px; }
+  h2 { font-size:16px; margin:0 0 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+  form { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:12px; align-items:end; }
+  label { display:flex; flex-direction:column; gap:4px; font-size:13px; }
+  input, select, button { font:inherit; padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+  button, .btn { background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; text-decoration:none; text-align:center; }
+  button:disabled { opacity:.5; cursor:wait; }
+  #status { margin:0 0 16px; min-height:1.5em; }
+  #status.error { color:var(--err); }
+  #result { display:none; }
+  .cols { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:800px) { .cols { grid-template-columns:1fr; } }
+  iframe { width:100%; height:75vh; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  pre { margin:0; height:75vh; overflow:auto; white-space:pre-wrap; word-break:break-word; padding:10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); font:13px/1.45 ui-monospace, Consolas, monospace; }
+  .head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:8px; }
+  .head h2 { margin:0; }
+  .head .btn, .head button { padding:5px 12px; font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PDF OCR – Testseite</h1>
+
+  <div class="card">
+    <form id="form">
+      <label>PDF-Datei
+        <input type="file" id="file" accept="application/pdf,.pdf" required>
+      </label>
+      <label>Sprache
+        <select id="lang"><option value="de-DE">de-DE</option><option value="en-US">en-US</option></select>
+      </label>
+      <label>Typ
+        <select id="type">
+          <option value="exact">exact (Bild unverändert)</option>
+          <option value="deskew">deskew (Bild begradigen)</option>
+        </select>
+      </label>
+      <label>API-Key (falls gesetzt)
+        <input type="password" id="key" autocomplete="off">
+      </label>
+      <button type="submit" id="go">OCR starten</button>
+    </form>
+  </div>
+
+  <p id="status" role="status"></p>
+
+  <div id="result">
+    <div class="cols">
+      <div class="card">
+        <div class="head">
+          <h2>Erzeugtes Dokument</h2>
+          <a class="btn" id="download">Herunterladen</a>
+        </div>
+        <iframe id="viewer" title="OCR-PDF"></iframe>
+      </div>
+      <div class="card">
+        <div class="head">
+          <h2>Textlayer (Plaintext)</h2>
+          <button type="button" id="copy">Kopieren</button>
+        </div>
+        <pre id="text"></pre>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script type="module">
+import * as pdfjs from "/vendor/pdfjs/pdf.min.mjs";
+pdfjs.GlobalWorkerOptions.workerSrc = "/vendor/pdfjs/pdf.worker.min.mjs";
+
+const $ = (id) => document.getElementById(id);
+const status = (msg, error = false) => { $("status").textContent = msg; $("status").className = error ? "error" : ""; };
+const authHeaders = () => ($("key").value ? { "X-API-Key": $("key").value } : {});
+
+try { $("key").value = sessionStorage.getItem("apiKey") ?? ""; } catch {}
+
+async function loadLanguages() {
+  try {
+    const res = await fetch("/api/languages", { headers: authHeaders() });
+    if (!res.ok) return;
+    const { languages, default: def } = await res.json();
+    const current = $("lang").value || def;
+    $("lang").replaceChildren(...languages.sort().map((l) => new Option(l, l, false, l === current)));
+  } catch {}
+}
+$("key").addEventListener("change", () => {
+  try { sessionStorage.setItem("apiKey", $("key").value); } catch {}
+  loadLanguages();
+});
+loadLanguages();
+
+async function extractText(blob) {
+  const pdf = await pdfjs.getDocument({ data: await blob.arrayBuffer() }).promise;
+  const pages = [];
+  for (let n = 1; n <= pdf.numPages; n++) {
+    const content = await (await pdf.getPage(n)).getTextContent();
+    let text = "";
+    for (const item of content.items) {
+      text += item.str;
+      text += item.hasEOL ? "\n" : "";
+    }
+    pages.push(`=== Seite ${n} ===\n${text.trim() || "(kein Text erkannt)"}`);
+  }
+  return pages.join("\n\n");
+}
+
+let objectUrl;
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const file = $("file").files[0];
+  if (!file) return;
+  $("go").disabled = true;
+  $("result").style.display = "none";
+  status("OCR läuft … das kann je nach Seitenzahl etwas dauern.");
+  try {
+    const body = new FormData();
+    body.append("file", file);
+    body.append("lang", $("lang").value);
+    body.append("type", $("type").value);
+    const res = await fetch("/api/ocr", { method: "POST", headers: authHeaders(), body });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error ?? `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    status("Textlayer wird ausgelesen …");
+    const text = await extractText(blob);
+
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    objectUrl = URL.createObjectURL(blob);
+    $("viewer").src = objectUrl;
+    $("download").href = objectUrl;
+    $("download").download = file.name.replace(/\.pdf$/i, "") + ".ocr.pdf";
+    $("text").textContent = text;
+    $("result").style.display = "block";
+    status(`Fertig (${(blob.size / 1024).toFixed(0)} KB).`);
+  } catch (err) {
+    status(`Fehler: ${err.message}`, true);
+  } finally {
+    $("go").disabled = false;
+  }
+});
+
+$("copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("text").textContent); status("Text kopiert."); }
+  catch { status("Kopieren nicht möglich.", true); }
+});
+</script>
+</body>
+</html>
