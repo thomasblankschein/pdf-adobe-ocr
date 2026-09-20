@@ -18,3 +18,11 @@ export function parseType(value: string): OCRSupportedType {
 export function supportedLocales(): string[] {
   return Object.values(OCRSupportedLocale);
 }
+
+/** Ja/Nein-Feld (z. B. llm=true). Leer = nein. Wirft bei unbekanntem Wert. */
+export function parseFlag(value: string, name: string): boolean {
+  const v = value.trim().toLowerCase();
+  if (["true", "1", "yes", "on", "ja"].includes(v)) return true;
+  if (["", "false", "0", "no", "off", "nein", "none"].includes(v)) return false;
+  throw new Error(`Ungültiger Wert für "${name}": "${value}" (true | false).`);
+}

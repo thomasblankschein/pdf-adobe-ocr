@@ -6,9 +6,12 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import express, { type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
+import { PDFDocument } from "pdf-lib";
+import { createLlmClient, llmSetup, type LlmClient } from "./llm";
 import { logger } from "./logger";
 import { createClient, ocrStream } from "./ocr";
-import { DEFAULT_LANG, DEFAULT_TYPE, parseLocale, parseType, supportedLocales } from "./options";
+import { DEFAULT_LANG, DEFAULT_TYPE, parseFlag, parseLocale, parseType, supportedLocales } from "./options";
+import { refinePdf } from "./refine";
 
 try {
   process.loadEnvFile();
@@ -20,6 +23,11 @@ const PORT = Number(process.env.PORT ?? 3000);
 const API_KEY = process.env.API_KEY;
 // Adobe erlaubt für OCR maximal 100 MB pro Datei
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB ?? 100);
+// LLM-Nachbearbeitung (optional pro Request)
+const LLM_MAX_PAGES = Number(process.env.LLM_MAX_PAGES ?? 50);
+const LLM_CONCURRENCY = Math.max(1, Number(process.env.LLM_CONCURRENCY ?? 3));
+const LLM_IMAGE_MAX_PX = Number(process.env.LLM_IMAGE_MAX_PX ?? 2000);
+const LLM_MAX_BOXES_PER_CALL = Math.max(1, Number(process.env.LLM_MAX_BOXES_PER_CALL ?? 800));
 
 const client = (() => {
   try {
@@ -95,7 +103,46 @@ app.get("/api/languages", requireApiKey, (_req, res) => {
   res.json({ default: DEFAULT_LANG, languages: supportedLocales() });
 });
 
-// POST /api/ocr — multipart/form-data: file (PDF), optional lang, type (exact | deskew)
+class BadRequest extends Error {}
+
+const param = (req: Request, name: string): string => String(req.body?.[name] ?? req.query[name] ?? "").trim();
+
+/** Liest das Feld llm (true/false); Anbieter und Modell kommen aus der .env. undefined = keine Nachbearbeitung. */
+function parseLlm(req: Request): LlmClient | undefined {
+  if (!parseFlag(param(req, "llm"), "llm")) return undefined;
+  const setup = llmSetup();
+  if (setup.status === "off") throw new BadRequest("LLM-Nachbearbeitung ist auf dem Server nicht konfiguriert (LLM_PROVIDER).");
+  if (setup.status === "error") throw new BadRequest(`LLM-Nachbearbeitung ist fehlerhaft konfiguriert: ${setup.reason}`);
+  return createLlmClient(setup);
+}
+
+async function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk as Buffer));
+  return Buffer.concat(chunks);
+}
+
+function setPdfHeaders(res: Response, originalName: string) {
+  const base = path.basename(originalName, path.extname(originalName)) || "dokument";
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${base.replace(/[^\w.-]/g, "_")}.ocr.pdf"; filename*=UTF-8''${encodeURIComponent(base)}.ocr.pdf`
+  );
+}
+
+app.get("/api/llm", requireApiKey, (_req, res) => {
+  const setup = llmSetup();
+  res.json({
+    enabled: setup.status === "ready",
+    provider: setup.status === "ready" ? setup.provider : undefined,
+    model: setup.status === "ready" ? setup.model : undefined,
+    error: setup.status === "error" ? setup.reason : undefined,
+    maxPages: LLM_MAX_PAGES,
+  });
+});
+
+// POST /api/ocr — multipart/form-data: file (PDF), optional lang, type (exact | deskew), llm (true | false)
 app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next) => {
   const file = req.file;
   try {
@@ -103,10 +150,22 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       res.status(400).json({ error: 'Feld "file" (PDF) fehlt.' });
       return;
     }
-    let locale: OCRSupportedLocale, type: OCRSupportedType;
+    let locale: OCRSupportedLocale, type: OCRSupportedType, llm: LlmClient | undefined;
     try {
-      locale = parseLocale(String(req.body?.lang ?? req.query.lang ?? DEFAULT_LANG));
-      type = parseType(String(req.body?.type ?? req.query.type ?? DEFAULT_TYPE));
+      locale = parseLocale(param(req, "lang") || DEFAULT_LANG);
+      type = parseType(param(req, "type") || DEFAULT_TYPE);
+      llm = parseLlm(req);
+      if (llm) {
+        // Vor dem (kostenpflichtigen) Adobe-Aufruf prüfen, ob die Datei lesbar und nicht zu lang ist
+        const pages = await PDFDocument.load(await fs.promises.readFile(file.path), { ignoreEncryption: true, updateMetadata: false })
+          .then((d) => d.getPageCount())
+          .catch(() => {
+            throw new BadRequest("Die Datei ist keine lesbare PDF.");
+          });
+        if (pages > LLM_MAX_PAGES) {
+          throw new BadRequest(`Mit LLM-Nachbearbeitung sind höchstens ${LLM_MAX_PAGES} Seiten erlaubt (Datei: ${pages}).`);
+        }
+      }
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
       return;
@@ -120,17 +179,45 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       sizeKb: Math.round(file.size / 1024),
       lang: locale,
       type,
+      llm: llm?.label,
     });
     const result = await ocrStream(client, fs.createReadStream(file.path), { locale, type });
-    logger.info("ocr adobe fertig", { reqId, ms: Date.now() - t0 });
-    const base = path.basename(file.originalname, path.extname(file.originalname)) || "dokument";
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${base.replace(/[^\w.-]/g, "_")}.ocr.pdf"; filename*=UTF-8''${encodeURIComponent(base)}.ocr.pdf`
-    );
-    await pipeline(result, res);
-    logger.info("ocr ausgeliefert", { reqId, bytes: res.socket?.bytesWritten, ms: Date.now() - t0 });
+
+    if (!llm) {
+      logger.info("ocr adobe fertig", { reqId, ms: Date.now() - t0 });
+      setPdfHeaders(res, file.originalname);
+      await pipeline(result, res);
+      logger.info("ocr ausgeliefert", { reqId, bytes: res.socket?.bytesWritten, ms: Date.now() - t0 });
+      return;
+    }
+
+    // Mit LLM: Adobe-Ergebnis komplett einlesen, Textboxen per Modell korrigieren, neues PDF ausliefern
+    const adobePdf = await readAll(result);
+    logger.info("ocr adobe fertig", { reqId, ms: Date.now() - t0, bytes: adobePdf.length });
+    const t1 = Date.now();
+    const refined = await refinePdf(adobePdf, {
+      client: llm,
+      maxImagePx: LLM_IMAGE_MAX_PX,
+      concurrency: LLM_CONCURRENCY,
+      maxBoxesPerCall: LLM_MAX_BOXES_PER_CALL,
+      reqId,
+    });
+    logger.info("llm fertig", {
+      reqId,
+      model: llm.label,
+      pages: refined.pages,
+      pagesRefined: refined.pagesRefined,
+      pagesFailed: refined.pagesFailed,
+      corrections: refined.corrections,
+      ms: Date.now() - t1,
+    });
+    setPdfHeaders(res, file.originalname);
+    res.setHeader("X-OCR-LLM", llm.label);
+    res.setHeader("X-OCR-LLM-Pages", `${refined.pagesRefined}/${refined.pages}`);
+    res.setHeader("X-OCR-LLM-Corrections", String(refined.corrections));
+    res.setHeader("X-OCR-LLM-Failed", String(refined.pagesFailed));
+    res.end(Buffer.from(refined.pdf));
+    logger.info("ocr ausgeliefert", { reqId, bytes: refined.pdf.length, ms: Date.now() - t0 });
   } catch (err) {
     next(err);
   } finally {
@@ -156,8 +243,15 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 });
 
 const server = app.listen(PORT, () => {
-  logger.info("service gestartet", { port: PORT, maxUploadMb: MAX_UPLOAD_MB, apiKey: API_KEY ? "gesetzt" : "nicht gesetzt" });
+  const llm = llmSetup();
+  logger.info("service gestartet", {
+    port: PORT,
+    maxUploadMb: MAX_UPLOAD_MB,
+    apiKey: API_KEY ? "gesetzt" : "nicht gesetzt",
+    llm: llm.status === "ready" ? `${llm.provider}/${llm.model}` : "aus",
+  });
   if (!API_KEY) logger.warn("API_KEY nicht gesetzt: /api/* ist ungeschützt");
+  if (llm.status === "error") logger.error("LLM-Konfiguration fehlerhaft, Nachbearbeitung nicht verfügbar", { reason: llm.reason });
 });
 
 function shutdown(signal: string) {
