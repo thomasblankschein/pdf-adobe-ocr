@@ -1,0 +1,21 @@
+services:
+  pdf-adobe-ocr:
+    build: .
+    container_name: pdf-adobe-ocr
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LOG_FORMAT: json
+      PORT: "3000" # Container-Port fest; PORT aus der .env steuert nur das Host-Mapping
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "${PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
