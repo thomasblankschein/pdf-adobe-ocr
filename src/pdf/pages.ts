@@ -19,6 +19,8 @@ export interface PageItem {
 }
 
 export interface PageData {
+  /** Seitendrehung (/Rotate) in Grad */
+  rotation: number;
   image: PageImage;
   items: PageItem[];
   boxes: TextBox[];
@@ -89,7 +91,7 @@ export async function extractPage(
         h: Math.max(1, Math.round(((Math.max(...ys) - y0) / base.height) * 1000)),
       });
     }
-    return { image: { jpeg, width, height }, items, boxes };
+    return { rotation: ((page.rotate % 360) + 360) % 360, image: { jpeg, width, height }, items, boxes };
   } finally {
     page.cleanup();
   }

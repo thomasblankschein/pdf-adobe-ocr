@@ -56,6 +56,10 @@
         <input type="checkbox" id="llm" disabled>
         <span id="llmInfo">LLM-Nachbearbeitung (nicht konfiguriert)</span>
       </label>
+      <label class="check">
+        <input type="checkbox" id="meta" disabled>
+        <span>Datum, Korrespondent und Inhalt lesen (Ablagevorschlag)</span>
+      </label>
       <label>API-Key (falls gesetzt)
         <input type="password" id="key" autocomplete="off">
       </label>
@@ -111,7 +115,8 @@ async function loadLlm() {
     if (!res.ok) return;
     const cfg = await res.json();
     $("llm").disabled = !cfg.enabled;
-    if (!cfg.enabled) $("llm").checked = false;
+    $("meta").disabled = !cfg.enabled;
+    if (!cfg.enabled) $("llm").checked = $("meta").checked = false;
     $("llmInfo").textContent = cfg.enabled
       ? `LLM-Nachbearbeitung (${cfg.provider} / ${cfg.model})`
       : `LLM-Nachbearbeitung (nicht konfiguriert${cfg.error ? ": " + cfg.error : ""})`;
@@ -148,7 +153,7 @@ $("form").addEventListener("submit", async (e) => {
   $("go").disabled = true;
   $("result").style.display = "none";
   status(
-    $("llm").checked
+    $("llm").checked || $("meta").checked
       ? "OCR läuft (Adobe + LLM-Nachbearbeitung) … das kann einige Minuten dauern."
       : "OCR läuft … das kann je nach Seitenzahl etwas dauern."
   );
@@ -158,6 +163,7 @@ $("form").addEventListener("submit", async (e) => {
     body.append("lang", $("lang").value);
     body.append("type", $("type").value);
     if ($("llm").checked) body.append("llm", "true");
+    if ($("meta").checked) body.append("meta", "true");
     const res = await fetch("/api/ocr", { method: "POST", headers: authHeaders(), body });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -177,7 +183,15 @@ $("form").addEventListener("submit", async (e) => {
     const llm = res.headers.get("X-OCR-LLM");
     const failed = Number(res.headers.get("X-OCR-LLM-Failed") ?? 0);
     let msg = `Fertig (${(blob.size / 1024).toFixed(0)} KB).`;
-    if (llm) msg += ` LLM ${llm}: ${res.headers.get("X-OCR-LLM-Corrections")} Textboxen korrigiert auf ${res.headers.get("X-OCR-LLM-Pages")} Seiten.`;
+    const corrections = res.headers.get("X-OCR-LLM-Corrections");
+    if (llm && corrections !== null) msg += ` LLM ${llm}: ${corrections} Textboxen korrigiert auf ${res.headers.get("X-OCR-LLM-Pages")} Seiten.`;
+    const metaHeader = res.headers.get("X-OCR-Meta");
+    if (metaHeader) {
+      const m = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(metaHeader), (c) => c.charCodeAt(0))));
+      msg += ` Ablagevorschlag: ${m.path} (Sicherheit: ${m.confidence}, Datum aus ${m.dateSource === "document" ? "Dokument" : "Scan"}).`;
+    } else if ($("meta").checked) {
+      msg += " Metadaten konnten nicht gelesen werden.";
+    }
     if (failed) msg += ` Achtung: Bei ${failed} Seite(n) ist die LLM-Nachbearbeitung fehlgeschlagen, dort gilt der Adobe-Text.`;
     status(msg, failed > 0);
   } catch (err) {

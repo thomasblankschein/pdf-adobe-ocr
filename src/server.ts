@@ -11,7 +11,8 @@ import { createLlmClient, llmSetup, type LlmClient } from "./llm";
 import { logger } from "./logger";
 import { createClient, ocrStream } from "./ocr";
 import { DEFAULT_LANG, DEFAULT_TYPE, parseFlag, parseLocale, parseType, supportedLocales } from "./options";
-import { refinePdf } from "./refine";
+import { buildDocumentMeta, ownNames, stampPdfMetadata, validDate, type DocumentMeta } from "./meta";
+import { refinePdf, type RefineResult } from "./refine";
 
 try {
   process.loadEnvFile();
@@ -26,8 +27,10 @@ const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB ?? 100);
 // LLM-Nachbearbeitung (optional pro Request)
 const LLM_MAX_PAGES = Number(process.env.LLM_MAX_PAGES ?? 50);
 const LLM_CONCURRENCY = Math.max(1, Number(process.env.LLM_CONCURRENCY ?? 3));
-const LLM_IMAGE_MAX_PX = Number(process.env.LLM_IMAGE_MAX_PX ?? 2000);
+const LLM_IMAGE_MAX_PX = Number(process.env.LLM_IMAGE_MAX_PX ?? 2576);
 const LLM_MAX_BOXES_PER_CALL = Math.max(1, Number(process.env.LLM_MAX_BOXES_PER_CALL ?? 800));
+// Ausweichfall: Seiten mit unbrauchbarer Adobe-Textebene komplett vom Modell transkribieren lassen
+const LLM_TRANSCRIBE = (process.env.LLM_TRANSCRIBE ?? "true").toLowerCase() !== "false";
 
 const client = (() => {
   try {
@@ -107,14 +110,14 @@ class BadRequest extends Error {}
 
 const param = (req: Request, name: string): string => String(req.body?.[name] ?? req.query[name] ?? "").trim();
 
-/** Liest das Feld llm (true/false); Anbieter und Modell kommen aus der .env. undefined = keine Nachbearbeitung. */
-function parseLlm(req: Request): LlmClient | undefined {
-  if (!parseFlag(param(req, "llm"), "llm")) return undefined;
+/** Modell-Client aus der .env-Konfiguration (Anbieter und Modell legt der Betreiber fest). */
+function requireLlmClient(): LlmClient {
   const setup = llmSetup();
-  if (setup.status === "off") throw new BadRequest("LLM-Nachbearbeitung ist auf dem Server nicht konfiguriert (LLM_PROVIDER).");
-  if (setup.status === "error") throw new BadRequest(`LLM-Nachbearbeitung ist fehlerhaft konfiguriert: ${setup.reason}`);
+  if (setup.status === "off") throw new BadRequest("LLM ist auf dem Server nicht konfiguriert (LLM_PROVIDER).");
+  if (setup.status === "error") throw new BadRequest(`LLM ist fehlerhaft konfiguriert: ${setup.reason}`);
   return createLlmClient(setup);
 }
+
 
 async function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -142,7 +145,11 @@ app.get("/api/llm", requireApiKey, (_req, res) => {
   });
 });
 
-// POST /api/ocr — multipart/form-data: file (PDF), optional lang, type (exact | deskew), llm (true | false)
+// POST /api/ocr — multipart/form-data: file (PDF), optional lang, type (exact | deskew),
+//   llm (true | false)   Textboxen per LLM korrigieren
+//   meta (true | false)  Datum, Korrespondent und Kurzinhalt lesen (Header X-OCR-Meta)
+//   lenient (true|false) Modellfehler brechen die Anfrage nicht ab: es kommt immer mindestens das Adobe-Ergebnis
+//   scan_date            YYYY-MM-DD, Ersatz für ein nicht lesbares Dokumentdatum
 app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next) => {
   const file = req.file;
   try {
@@ -151,11 +158,18 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       return;
     }
     let locale: OCRSupportedLocale, type: OCRSupportedType, llm: LlmClient | undefined;
+    let wantCorrect: boolean, wantMeta: boolean, lenient: boolean, scanDate: string | undefined;
+    let skippedForLength = false;
     try {
       locale = parseLocale(param(req, "lang") || DEFAULT_LANG);
       type = parseType(param(req, "type") || DEFAULT_TYPE);
-      llm = parseLlm(req);
-      if (llm) {
+      wantCorrect = parseFlag(param(req, "llm"), "llm");
+      wantMeta = parseFlag(param(req, "meta"), "meta");
+      lenient = parseFlag(param(req, "lenient"), "lenient");
+      scanDate = param(req, "scan_date") || undefined;
+      if (scanDate && !validDate(scanDate)) throw new BadRequest('Ungültiger Wert für "scan_date" (YYYY-MM-DD).');
+      if (wantCorrect || wantMeta) {
+        llm = requireLlmClient();
         // Vor dem (kostenpflichtigen) Adobe-Aufruf prüfen, ob die Datei lesbar und nicht zu lang ist
         const pages = await PDFDocument.load(await fs.promises.readFile(file.path), { ignoreEncryption: true, updateMetadata: false })
           .then((d) => d.getPageCount())
@@ -163,7 +177,14 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
             throw new BadRequest("Die Datei ist keine lesbare PDF.");
           });
         if (pages > LLM_MAX_PAGES) {
-          throw new BadRequest(`Mit LLM-Nachbearbeitung sind höchstens ${LLM_MAX_PAGES} Seiten erlaubt (Datei: ${pages}).`);
+          if (!lenient) {
+            throw new BadRequest(`Mit LLM sind höchstens ${LLM_MAX_PAGES} Seiten erlaubt (Datei: ${pages}).`);
+          }
+          // lenient: das Dokument bekommt trotzdem OCR, nur ohne (teure) LLM-Korrektur; Metadaten kommen von Seite 1
+          skippedForLength = true;
+          wantCorrect = false;
+          if (!wantMeta) llm = undefined;
+          logger.warn("llm-korrektur übersprungen: zu viele seiten", { reqId: res.locals.reqId, pages, max: LLM_MAX_PAGES });
         }
       }
     } catch (err) {
@@ -180,28 +201,55 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       lang: locale,
       type,
       llm: llm?.label,
+      correct: wantCorrect,
+      meta: wantMeta,
+      lenient: lenient || undefined,
     });
     const result = await ocrStream(client, fs.createReadStream(file.path), { locale, type });
 
     if (!llm) {
       logger.info("ocr adobe fertig", { reqId, ms: Date.now() - t0 });
       setPdfHeaders(res, file.originalname);
+      if (skippedForLength) res.setHeader("X-OCR-LLM-Skipped", "max-pages");
       await pipeline(result, res);
       logger.info("ocr ausgeliefert", { reqId, bytes: res.socket?.bytesWritten, ms: Date.now() - t0 });
       return;
     }
 
-    // Mit LLM: Adobe-Ergebnis komplett einlesen, Textboxen per Modell korrigieren, neues PDF ausliefern
+    // Mit LLM: Adobe-Ergebnis komplett einlesen, Textboxen korrigieren und/oder Dokumentdaten lesen
     const adobePdf = await readAll(result);
     logger.info("ocr adobe fertig", { reqId, ms: Date.now() - t0, bytes: adobePdf.length });
     const t1 = Date.now();
-    const refined = await refinePdf(adobePdf, {
-      client: llm,
-      maxImagePx: LLM_IMAGE_MAX_PX,
-      concurrency: LLM_CONCURRENCY,
-      maxBoxesPerCall: LLM_MAX_BOXES_PER_CALL,
-      reqId,
-    });
+    let refined: RefineResult;
+    try {
+      refined = await refinePdf(adobePdf, {
+        client: llm,
+        correct: wantCorrect,
+        transcribe: LLM_TRANSCRIBE,
+        meta: wantMeta ? { ownNames: ownNames() } : undefined,
+        maxImagePx: LLM_IMAGE_MAX_PX,
+        concurrency: LLM_CONCURRENCY,
+        maxBoxesPerCall: LLM_MAX_BOXES_PER_CALL,
+        lenient,
+        reqId,
+      });
+    } catch (err) {
+      if (!lenient) throw err;
+      // lenient: das Adobe-Ergebnis geht trotzdem raus
+      logger.error("llm fehlgeschlagen, liefere Adobe-Ergebnis", { reqId, err });
+      refined = { pdf: adobePdf, pages: 0, pagesRefined: 0, pagesFailed: 1, corrections: 0, pagesTranscribed: 0, errors: [String(err)] };
+    }
+
+    let outPdf = refined.pdf;
+    let docMeta: DocumentMeta | undefined;
+    if (refined.meta) {
+      docMeta = buildDocumentMeta(refined.meta, scanDate);
+      try {
+        outPdf = await stampPdfMetadata(outPdf, docMeta);
+      } catch (err) {
+        logger.warn("pdf-eigenschaften nicht geschrieben", { reqId, err });
+      }
+    }
     logger.info("llm fertig", {
       reqId,
       model: llm.label,
@@ -209,15 +257,22 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       pagesRefined: refined.pagesRefined,
       pagesFailed: refined.pagesFailed,
       corrections: refined.corrections,
+      transcribed: refined.pagesTranscribed || undefined,
+      meta: docMeta ? docMeta.path : wantMeta ? `fehlgeschlagen: ${refined.metaError ?? "unbekannt"}` : undefined,
       ms: Date.now() - t1,
     });
     setPdfHeaders(res, file.originalname);
     res.setHeader("X-OCR-LLM", llm.label);
-    res.setHeader("X-OCR-LLM-Pages", `${refined.pagesRefined}/${refined.pages}`);
-    res.setHeader("X-OCR-LLM-Corrections", String(refined.corrections));
-    res.setHeader("X-OCR-LLM-Failed", String(refined.pagesFailed));
-    res.end(Buffer.from(refined.pdf));
-    logger.info("ocr ausgeliefert", { reqId, bytes: refined.pdf.length, ms: Date.now() - t0 });
+    if (wantCorrect) {
+      res.setHeader("X-OCR-LLM-Pages", `${refined.pagesRefined}/${refined.pages}`);
+      res.setHeader("X-OCR-LLM-Corrections", String(refined.corrections));
+      res.setHeader("X-OCR-LLM-Failed", String(refined.pagesFailed));
+    }
+    if (wantCorrect && refined.pagesTranscribed > 0) res.setHeader("X-OCR-LLM-Transcribed", String(refined.pagesTranscribed));
+    if (skippedForLength) res.setHeader("X-OCR-LLM-Skipped", "max-pages");
+    if (docMeta) res.setHeader("X-OCR-Meta", Buffer.from(JSON.stringify(docMeta), "utf8").toString("base64"));
+    res.end(Buffer.from(outPdf));
+    logger.info("ocr ausgeliefert", { reqId, bytes: outPdf.length, ms: Date.now() - t0 });
   } catch (err) {
     next(err);
   } finally {
