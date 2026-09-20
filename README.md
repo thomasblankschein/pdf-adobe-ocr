@@ -62,10 +62,12 @@ Alle Einstellungen erfolgen über Umgebungsvariablen (bei Docker über die `.env
 | `ANTHROPIC_API_KEY` | API-Key für `LLM_PROVIDER=anthropic` | leer |
 | `OPENAI_API_KEY` | API-Key für `LLM_PROVIDER=openai` | leer |
 | `LLM_CONCURRENCY` | Seiten, die parallel an das Modell gehen | `3` |
-| `LLM_IMAGE_MAX_PX` | lange Kante des Seitenbilds, das an das Modell geht | `2000` |
-| `LLM_MAX_PAGES` | maximale Seitenzahl pro Request mit LLM (Kostenschutz) | `50` |
+| `LLM_IMAGE_MAX_PX` | lange Kante des Seitenbilds, das an das Modell geht (2576 ist die Obergrenze von Claude Sonnet 5; kleinere Schrift braucht Auflösung) | `2576` |
+| `LLM_MAX_PAGES` | Seitenzahl, bis zu der ein Dokument LLM-korrigiert wird (Kostenschutz). Längere Dokumente werden mit `lenient=true` trotzdem per Adobe verarbeitet (ohne Korrektur), sonst mit `400` abgelehnt | `50` |
+| `LLM_TRANSCRIBE` | Ausweichfall bei unbrauchbarer Adobe-Textebene (siehe [unten](#ausweichfall-unbrauchbare-adobe-textebene)); `false` schaltet ihn ab | `true` |
 | `LLM_MAX_BOXES_PER_CALL` | maximale Textboxen pro Modellaufruf; größere Seiten werden aufgeteilt | `800` |
 | `LLM_TIMEOUT_S` | Timeout je Modellaufruf in Sekunden | `180` |
+| `OWN_NAMES` | Namen, Adressen und Mailadressen des Empfängers, durch `;` getrennt (z. B. `Max Muster; Musterweg 1, 12345 Musterstadt`). Das Modell erkennt damit den Absender statt des Empfängers | leer |
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
 | `LOG_FORMAT` | `json` oder `text` | `json` im Container, `text` lokal |
 
@@ -100,6 +102,9 @@ So lässt sich sofort prüfen, wie gut die Texterkennung bei einem Dokument funk
 | `lang` | nein | OCR-Sprache, Standard `de-DE` (Liste über `GET /api/languages`) |
 | `type` | nein | `exact` (Standard): Originalbild bleibt unverändert; `deskew`: Bild wird begradigt |
 | `llm` | nein | LLM-Nachbearbeitung ein/aus: `true` oder `false` (Standard). Anbieter und Modell kommen aus der `.env` (`LLM_PROVIDER`, `LLM_MODEL`) |
+| `meta` | nein | `true`: Datum, Korrespondent und Kurzinhalt von der ersten Seite lesen und einen Ablagepfad vorschlagen (Header `X-OCR-Meta`, siehe [Dokumentdaten](#dokumentdaten-und-ablagevorschlag)). Braucht ein konfiguriertes LLM |
+| `lenient` | nein | `true`: Fehler des LLM brechen die Anfrage nie ab; es kommt immer mindestens das Adobe-Ergebnis (für automatische Abläufe). Dokumente über `LLM_MAX_PAGES` Seiten werden dann nicht abgelehnt, sondern nur ohne LLM-Korrektur verarbeitet (Metadaten von Seite 1 gibt es trotzdem) |
+| `scan_date` | nein | `YYYY-MM-DD`; ersetzt ein nicht lesbares Dokumentdatum im Ablagevorschlag |
 
 Die Antwort ist die OCR-PDF (`Content-Type: application/pdf`, Dateiname `<name>.ocr.pdf` im `Content-Disposition`-Header). Der Aufruf ist **synchron** – Client-Timeouts entsprechend großzügig setzen.
 
@@ -120,7 +125,7 @@ curl -H "X-API-Key: <key>" http://localhost:3000/api/languages
 
 | Status | Ursache |
 |---|---|
-| `400` | ungültige Eingabe (kein `file`, unbekannte Sprache oder Typ; bei `llm=true`: ungültiger Wert, LLM auf dem Server nicht oder fehlerhaft konfiguriert, Datei keine lesbare PDF, mehr als `LLM_MAX_PAGES` Seiten) |
+| `400` | ungültige Eingabe (kein `file`, unbekannte Sprache oder Typ; bei `llm=true`: ungültiger Wert, LLM auf dem Server nicht oder fehlerhaft konfiguriert, Datei keine lesbare PDF, mehr als `LLM_MAX_PAGES` Seiten – außer mit `lenient=true`) |
 | `401` | fehlender oder falscher API-Key |
 | `413` | Datei größer als `MAX_UPLOAD_MB` |
 | `502` | Fehler bei Adobe (z. B. ungültige Credentials, Kontingent erschöpft, beschädigte PDF) – oder, mit LLM, Fehler des Modellanbieters bei **allen** Seiten (z. B. ungültiger API-Key, unbekanntes Modell) |
@@ -133,8 +138,8 @@ Adobe liefert die Textboxen, die Texterkennung ist auf schlechten Scans aber oft
 
 1. Adobe erzeugt wie gewohnt das OCR-PDF.
 2. Pro Seite wird das Seitenbild gerendert (lange Kante `LLM_IMAGE_MAX_PX`) und zusammen mit den Textboxen von Adobe (ID, Position, erkannter Text) an das Modell geschickt.
-3. Das Modell antwortet nur mit den **Korrekturen** je Box (`id → richtiger Text`); ein leerer Text verwirft eine Box, die nur Rauschen erfasst hat. Beide Anbieter antworten im strukturierten JSON-Modus.
-4. Die Textebene von Adobe wird durch eine neue unsichtbare Ebene ersetzt: derselbe Boxen-Satz, dieselben Positionen und Breiten, aber mit dem korrigierten Text (eingebettete Schrift DejaVu Sans, Unicode-fähig). Seitenbild und alle übrigen PDF-Inhalte bleiben unverändert.
+3. Das Modell antwortet nur mit den **Korrekturen** je Box (`id → richtiger Text`); ein leerer Text verwirft eine Box, die nur Rauschen erfasst hat oder deren Inhalt in eine Nachbarbox gewandert ist. Adobe schneidet Wörter oft mitten durch („Be“ + „i Fragen“, „F“ + „ür“, „20,“ + „21“); das Modell darf deshalb Zeichen zwischen **unmittelbar benachbarten Boxen einer Zeile** verschieben, sodass jedes Wort ganz in einer Box liegt (Suche und Kopieren funktionieren dann). Beide Anbieter antworten im strukturierten JSON-Modus.
+4. Die Textebene von Adobe wird durch eine neue unsichtbare Ebene ersetzt: dieselben Boxen an denselben Positionen und mit denselben Breiten, aber mit dem korrigierten Text (eingebettete Schrift DejaVu Sans, Unicode-fähig; leere Boxen entfallen). Seitenbild und alle übrigen PDF-Inhalte bleiben unverändert.
 
 Das Modell liefert also nur **Text**, die **Positionen** kommen von Adobe – dadurch stimmen Markieren, Kopieren und Suchtreffer weiterhin mit dem Scan überein.
 
@@ -156,6 +161,16 @@ ANTHROPIC_API_KEY=…
 
 Bei `anthropic` ist `claude-opus-5` das Standardmodell, wenn `LLM_MODEL` fehlt; bei `openai` muss `LLM_MODEL` gesetzt werden, weil sich die Modellnamen dort häufig ändern. Das Modell muss Bildeingaben und strukturierte Ausgaben unterstützen. Ist `LLM_PROVIDER` leer oder fehlen Key bzw. Modell, meldet der Service beim Start einen Fehler im Log, läuft aber ohne LLM weiter; `llm=true` liefert dann `400` mit dem Grund. Die aktive Konfiguration zeigt `GET /api/llm`. Für einen Modellwechsel `LLM_MODEL` ändern und `docker compose up -d` ausführen.
 
+#### Ausweichfall: unbrauchbare Adobe-Textebene
+
+Bei stark verblassten oder verrauschten Scans (Kassenbons, Thermopapier) liest Adobe oft nur Rauschen als „Text“; die eigentliche Schrift hat dann gar keine Boxen, und Korrekturen einzelner Boxen helfen nicht. Der Service erkennt das (weniger als 50 % der erkannten Zeichen gehören zu plausiblen Wörtern, bei mindestens 40 Zeichen; normale Seiten liegen bei 85–99 %) und lässt das Modell die Seite stattdessen **komplett zeilenweise transkribieren**. Dasselbe passiert bei Seiten ohne jede Textebene, die sichtbaren Inhalt haben. Das Bild wird dafür zuerst aufbereitet (Rauschen dämpfen, Papierhintergrund herausrechnen). Die Textebene der Seite wird durch die Zeilen ersetzt.
+
+Das Modell darf dabei **nichts raten**, denn der Text landet in einem durchsuchbaren Archiv:
+
+- Jede Zeile trägt ein Flag `certain`; nur **sichere** Zeilen werden geschrieben.
+- Das Modell bewertet die Lesbarkeit der Seite (`good`, `partial`, `poor`). Bei `poor` wird gar keine Zeile geschrieben (Adobes Rauschen wird trotzdem entfernt), die Metadaten werden auf `confidence: low` gesetzt und das Datum verworfen (Ablage in `_Pruefen` mit dem Scandatum); bei `partial` gilt höchstens `medium`.
+- Die Positionen der Zeilen sind **nur grob** (das Modell schätzt sie; erfahrungsgemäß bis zu etwa 10 % der Seite daneben). Suchen funktioniert, das Markieren im Viewer trifft die Zeile nur ungefähr.
+
 **Zusätzliche Antwort-Header** bei LLM-Nachbearbeitung:
 
 | Header | Inhalt |
@@ -164,18 +179,48 @@ Bei `anthropic` ist `claude-opus-5` das Standardmodell, wenn `LLM_MODEL` fehlt; 
 | `X-OCR-LLM-Pages` | `<Seiten mit Änderungen>/<Seiten gesamt>` |
 | `X-OCR-LLM-Corrections` | Anzahl geänderter (oder verworfener) Textboxen |
 | `X-OCR-LLM-Failed` | Seiten, bei denen der Modellaufruf fehlgeschlagen ist |
+| `X-OCR-LLM-Transcribed` | Seiten, deren Textebene im Ausweichfall komplett neu transkribiert wurde (nur wenn > 0) |
+| `X-OCR-LLM-Skipped` | `max-pages`: das Dokument war länger als `LLM_MAX_PAGES`, es wurde nur per Adobe (und ggf. Metadaten) verarbeitet |
 
 **Verhalten bei Fehlern und Grenzfällen**
 
 - Schlägt der Modellaufruf nur bei einzelnen Seiten fehl, behalten diese Seiten den Adobe-Text; `X-OCR-LLM-Failed` und das Log (`llm seite fehlgeschlagen`) zeigen das an. Schlägt er bei **allen** Seiten fehl, antwortet der Service mit `502`.
 - Seiten ohne Änderung behalten ihre ursprüngliche Adobe-Textebene unangetastet.
-- Seiten, auf denen Adobe **keine** Textboxen gefunden hat, werden nicht nachbearbeitet – das Modell erhält nur Boxen zum Korrigieren und liefert keine neuen Positionen.
-- Die Prüfung von Dateiformat und Seitenzahl (`LLM_MAX_PAGES`) erfolgt vor dem Adobe-Aufruf, damit bei ungeeigneten Dateien keine Kosten entstehen.
+- Seiten, auf denen Adobe **keine** Textboxen gefunden hat, aber sichtbaren Inhalt (leere Rückseiten werden erkannt und übersprungen), sowie Seiten mit **unbrauchbarer** Textebene übernimmt der [Ausweichfall](#ausweichfall-unbrauchbare-adobe-textebene).
+- Die Prüfung von Dateiformat und Seitenzahl (`LLM_MAX_PAGES`) erfolgt vor dem Adobe-Aufruf, damit bei ungeeigneten Dateien keine Kosten entstehen. Bei `lenient=true` wird ein zu langes Dokument nicht abgelehnt, sondern ohne LLM-Korrektur verarbeitet (Header `X-OCR-LLM-Skipped: max-pages`).
 - Der Aufruf ist synchron; mit LLM dauert er deutlich länger (Client-Timeouts entsprechend setzen).
 
 **Kosten und Datenschutz:** Pro Seite entsteht ein Modellaufruf (bei mehr als `LLM_MAX_BOXES_PER_CALL` Boxen mehrere), abgerechnet vom jeweiligen Anbieter. Die **Seitenbilder** werden zusätzlich an Anthropic bzw. OpenAI übertragen – bei vertraulichen Unterlagen bedenken.
 
-**Stand der Erprobung:** Getestet ist der komplette Ablauf mit einem synthetischen Adobe-PDF und einem Stub-Modell (`npm run smoke`, auch im Alpine-Container) sowie die Request-Formen beider SDKs gegen einen lokalen Fake-Server. **Nicht getestet** sind echte Aufrufe gegen Adobe, Anthropic und OpenAI (in der Entwicklungsumgebung standen keine Zugangsdaten zur Verfügung) – insbesondere ob die Boxen echter Adobe-Ausgaben feiner (Wörter) oder gröber (Zeilen) geschnitten sind und wie gut die Modelle die Boxen zuordnen. Das sollte beim ersten Einsatz an einem echten Scan geprüft werden; Stellschrauben sind `LLM_IMAGE_MAX_PX`, `LLM_MAX_BOXES_PER_CALL` und das Modell.
+**Stand der Erprobung:** Automatisch geprüft (`npm run smoke`, auch im Alpine-Container) ist der Ablauf mit synthetischem Adobe-PDF und Stub-Modell, dazu die Request-Formen beider SDKs gegen einen lokalen Fake-Server. Ein **echter Lauf** (Adobe + `claude-sonnet-5`) an einem synthetischen, verrauschten und leicht schrägen Rechnungsbrief ergab, gemessen gegen den bekannten Originaltext: Wortfehlerrate 13,2 % nur mit Adobe, 11,0 % mit einer ersten Prompt-Fassung (Boxen durften nicht verändert werden), ca. 1 % mit dem heutigen Prompt (drei Läufe hintereinander; der Rest ist ein Leerzeichen in Adobes Text). Dauer mit LLM etwa 25 s pro Seite. Beobachtet wurden dabei: bei 2000 px Bildkante blieb Kleingedrucktes (6,5 pt) unkorrigiert, bei 2576 px nicht mehr (daher der Standard); das Modell überging in manchen Läufen die Fußzeile, bis der Prompt ausdrücklich verlangte, *alle* Boxen zu prüfen; einmal wurde „Be“ fälschlich zu „Bitte“ (Halluzination), was sich nicht wiederholte. **Nicht getestet** sind OpenAI-Modelle, schlechte reale Scans (nur eine saubere, synthetische Vorlage), mehrseitige Dokumente mit LLM und Handschrift. Auch bei Läufen mit identischen Einstellungen schwankt das Ergebnis leicht – für wichtige Dokumente stichprobenartig prüfen. Stellschrauben sind `LLM_IMAGE_MAX_PX`, `LLM_MAX_BOXES_PER_CALL` und das Modell.
+
+**Weitere Erprobung** (sieben synthetische, verrauschte Scans, die Kette bis ins Ziel, gegen den bekannten Originaltext gemessen): Ordner, Datum und Dateiname stimmten bei allen sechs lesbaren Dokumenten (Rechnung, Privatbrief mit „3. September 2026“, Kontoauszug, Dokument ohne Datum mit Scandatum als Ersatz, dreiseitiger Vertrag, Bescheid mit dem Empfänger als größtem Text); die Wortfehlerrate sank von 6,8 % (nur Adobe) auf 1,9 %. Ein extrem verblasster, verrauschter Kassenbon war für Adobe reines Rauschen; ein erster Ausweichfall ohne Sicherheitsflags ließ das Modell **Text erfinden** (Straße, Datum, Artikelnamen) – deshalb die oben beschriebenen Schranken. Damit landet dieser Bon ohne Text und ohne Datum in `_Pruefen`; ein mäßig verblasster, lesbarer Bon wurde dagegen vollständig und richtig transkribiert (13 von 13 Zeilen, alle als sicher markiert). Restfehler der Korrektur: einzelne zerschnittene Wörter werden nicht immer repariert, einzelne falsche Zeichen bleiben stehen.
+
+### Dokumentdaten und Ablagevorschlag
+
+Mit `meta=true` liest das LLM von der **ersten Seite** (Bild plus bereits korrigierter Text) drei Angaben: das **Dokumentdatum**, den **Korrespondenten** (Absender, nicht Empfänger – dafür `OWN_NAMES`) und einen **Kurzinhalt** in höchstens fünf Wörtern. Daraus baut der Service einen Ablagepfad. `meta` funktioniert mit und ohne `llm=true`; ohne Korrektur wird der Adobe-Text verwendet.
+
+Der Pfad steht im Antwort-Header `X-OCR-Meta` (Base64 von UTF-8-JSON):
+
+```json
+{"date":"2026-09-18","dateSource":"document","correspondent":"Telekom","summary":"Rechnung-Mobilfunk","confidence":"high","path":"Telekom/2026-09-18_Rechnung-Mobilfunk.pdf"}
+```
+
+| Fall | Pfad |
+|---|---|
+| Normal | `<Korrespondent>/<Datum>_<Kurzinhalt>.pdf` |
+| Kein Korrespondent erkannt | `_Unbekannt/<Datum>_<Kurzinhalt>.pdf` |
+| Modell unsicher (`confidence: low`) | `_Pruefen/<Datum>_<Korrespondent>_<Kurzinhalt>.pdf` |
+| Datum nicht lesbar | `scan_date` (`dateSource: "scan"`), sonst `ohne-Datum` |
+| Kein Kurzinhalt | `Scan` |
+
+Namen werden für SMB/Windows bereinigt (keine ` / : * ? " < > |`, keine Punkte oder Leerzeichen am Ende, keine reservierten Namen wie `CON`, begrenzte Länge, Umlaute bleiben); der Pfad hat immer genau **eine** Ordnerebene. Datum und Kurzinhalt werden zusätzlich als Titel, Autor und Erstellungsdatum in die PDF-Eigenschaften geschrieben.
+
+Schlägt nur das Lesen der Dokumentdaten fehl, kommt das PDF trotzdem, aber **ohne** `X-OCR-Meta`; der Aufrufer muss das als „Metadaten fehlen“ behandeln. Beispielaufruf (so ruft ihn der smb1-proxy auf):
+
+```bash
+curl -X POST http://localhost:3000/api/ocr   -H "X-API-Key: <key>"   -F file=@scan.pdf   -F llm=true -F meta=true -F lenient=true -F scan_date=2026-09-19   -D headers.txt -o scan.ocr.pdf
+```
 
 ### Kommandozeile
 
@@ -232,7 +277,8 @@ Aufbau:
 src/server.ts        Express-API: /api/ocr, /api/languages, /api/llm, /health, Request-Logging, API-Key
 src/ocr.ts           Adobe-Anbindung: Upload → OCR-Job → Download (ocrStream, ocrPdf)
 src/options.ts       Sprach-/Typ-Parsing, gemeinsam für CLI und API
-src/refine.ts        LLM-Nachbearbeitung: Seiten rendern, Boxen korrigieren lassen, PDF neu schreiben
+src/refine.ts        LLM-Nachbearbeitung: Seiten rendern, Boxen korrigieren lassen, Dokumentdaten lesen, PDF neu schreiben
+src/meta.ts          Ablagepfad aus Dokumentdaten (Bereinigung, Datumsprüfung), PDF-Eigenschaften
 src/llm/             Anbieter-Anbindung (anthropic.ts, openai.ts), Prompt/Schema, Konfiguration aus der .env
 src/pdf/             pages.ts (Seitenbild + Textboxen via pdf.js), textlayer.ts (alte Textebene entfernen, neue schreiben)
 scripts/smoke-refine.ts  Smoke-Test (npm run smoke)
