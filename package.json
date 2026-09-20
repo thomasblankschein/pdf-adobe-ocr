@@ -1,0 +1,22 @@
+{
+  "name": "pdf-adobe-ocr",
+  "version": "0.1.0",
+  "description": "Gescannte PDFs über die Adobe PDF Services API mit einem OCR-Textlayer versehen",
+  "private": true,
+  "scripts": {
+    "ocr": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@adobe/pdfservices-node-sdk": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
