@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Gescannte PDFs über die Adobe PDF Services API mit einem OCR-Textlayer versehen",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "ocr": "tsx src/index.ts",
     "serve": "tsx src/server.ts",

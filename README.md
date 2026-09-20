@@ -180,3 +180,7 @@ Dockerfile, docker-compose.yml
 - **Kosten/Kontingent:** Jeder OCR-Aufruf verbraucht Adobe-Transaktionen (Kontingent laut Adobe-Konto). Das CLI überspringt vorhandene Ausgaben; der Service verarbeitet jeden Aufruf neu.
 - **Datenschutz:** Die Dokumente werden zur Verarbeitung an Adobe übertragen – bei vertraulichen Unterlagen bedenken. Der Service selbst speichert nichts dauerhaft; hochgeladene Dateien liegen nur für die Dauer des Aufrufs im temporären Verzeichnis.
 - **Absicherung:** Der Service bringt kein TLS und keine Benutzerverwaltung mit. Für den Zugriff über ein Netzwerk einen `API_KEY` setzen und ihn hinter einem Reverse-Proxy mit HTTPS betreiben.
+
+## Lizenz
+
+[MIT](LICENSE) © 2026 Thomas Blankschein. Die Nutzung der Adobe PDF Services API unterliegt den Bedingungen von Adobe.
