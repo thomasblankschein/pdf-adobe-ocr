@@ -3,7 +3,10 @@ import type { LlmClient, RawMeta, TranscribedLine } from "./llm/types";
 type Legibility = "good" | "partial" | "poor";
 import { extractPage, openPdf, type PageItem } from "./pdf/pages";
 import { enhanceForReading, isJunkLayer, pageHasInk } from "./pdf/quality";
-import { rewriteTextLayers, type PageEdit } from "./pdf/textlayer";
+import { buildEntries, rewriteTextLayers, type PageEdit } from "./pdf/textlayer";
+
+/** Ab so vielen Änderungen in einem Durchgang lohnt sich ein weiterer */
+const MIN_CHANGES_FOR_NEXT_PASS = 5;
 
 export interface RefineOptions {
   client: LlmClient;
@@ -22,6 +25,8 @@ export interface RefineOptions {
   concurrency: number;
   /** Maximale Boxenzahl pro Modellaufruf (größere Seiten werden aufgeteilt) */
   maxBoxesPerCall: number;
+  /** Höchstzahl der Korrekturdurchgänge je Seite (Standard 1); ein weiterer folgt nur bei vielen Änderungen */
+  maxPasses?: number;
   /** true: Modellfehler brechen den Lauf nie ab (das Ergebnis enthält dann weniger Korrekturen) */
   lenient?: boolean;
   reqId?: string;
@@ -116,16 +121,35 @@ export async function refinePdf(input: Uint8Array, opts: RefineOptions): Promise
       }
     } else if (opts.correct && data.boxes.length > 0) {
       attempted++;
-      try {
-        for (let i = 0; i < data.boxes.length; i += opts.maxBoxesPerCall) {
-          const chunk = data.boxes.slice(i, i + opts.maxBoxesPerCall);
-          for (const c of await opts.client.correct(data.image, chunk)) {
-            if (c.text.trim() !== data.items[c.id].str.trim()) changed.set(c.id, c.text);
+      // Ein Durchgang übersieht bei schwierigen Scans einen Teil der Fehler; weitere Durchgänge sehen den schon
+      // korrigierten Text und konvergieren schnell (gemessen: 31 -> 2 -> 1 Änderungen)
+      const maxPasses = Math.max(1, opts.maxPasses ?? 1);
+      const current = (id: number) => changed.get(id) ?? data.items[id].str;
+      for (let pass = 1; pass <= maxPasses; pass++) {
+        let changesInPass = 0;
+        try {
+          // Boxen, die im vorigen Durchgang geleert wurden, sieht das Modell nicht mehr
+          const boxes = data.boxes.filter((b) => current(b.id).trim() !== "").map((b) => ({ ...b, text: current(b.id) }));
+          for (let i = 0; i < boxes.length; i += opts.maxBoxesPerCall) {
+            const chunk = boxes.slice(i, i + opts.maxBoxesPerCall);
+            for (const c of await opts.client.correct(data.image, chunk)) {
+              if (c.text.trim() !== current(c.id).trim()) {
+                changed.set(c.id, c.text);
+                changesInPass++;
+              }
+            }
           }
+        } catch (err) {
+          // Erster Durchgang gescheitert: Seite gilt als fehlgeschlagen; später nur Ergebnis behalten
+          if (pass === 1) correctionError = err;
+          else logger.warn("llm folgedurchgang fehlgeschlagen", { reqId: opts.reqId, page: n, pass, err });
+          break;
         }
-      } catch (err) {
-        correctionError = err;
+        logger.debug("llm durchgang", { reqId: opts.reqId, page: n, pass, changes: changesInPass });
+        if (changesInPass < MIN_CHANGES_FOR_NEXT_PASS) break;
       }
+      // Nur Boxen behalten, deren Text am Ende tatsächlich vom Adobe-Text abweicht
+      for (const [id, text] of changed) if (text.trim() === data.items[id].str.trim()) changed.delete(id);
     } else if (opts.correct) {
       logger.debug("llm seite ohne textboxen", { reqId: opts.reqId, page: n });
     }
@@ -171,7 +195,7 @@ export async function refinePdf(input: Uint8Array, opts: RefineOptions): Promise
     corrections += changed.size;
     edits.push({
       pageIndex: n - 1,
-      entries: data.items.map((item) => ({ item, text: changed.get(item.id) ?? item.str })),
+      entries: buildEntries(data.items, changed),
     });
   }
 

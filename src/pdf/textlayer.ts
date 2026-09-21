@@ -176,6 +176,49 @@ function addTextLayer(doc: PDFDocument, page: PDFPage, font: PDFFont, entries: {
   page.node.addContentStream(doc.context.register(doc.context.flateStream(ops.join("\n"))));
 }
 
+/**
+ * Erzeugt die Einträge der neuen Textebene. Nimmt eine Box durch die Korrektur den Text geleerter Nachbarn
+ * derselben Zeile auf (zerschnittenes Wort zusammengeführt), erhält sie deren gemeinsame Breite – sonst würde der
+ * längere Text auf die schmale Ursprungsbox gestaucht.
+ */
+export function buildEntries(items: PageItem[], texts: Map<number, string>): { item: PageItem; text: string }[] {
+  const textOf = (i: PageItem) => texts.get(i.id) ?? i.str;
+  const emptied = (i: PageItem) => i.str.trim() !== "" && textOf(i).trim() === "";
+  return items.map((item, idx) => {
+    const text = textOf(item);
+    if (!text.trim() || text.trim().length <= item.str.trim().length) return { item, text };
+    const [a, b, c, d, e, f] = item.transform;
+    const lenX = Math.hypot(a, b);
+    const lenY = Math.hypot(c, d);
+    if (!(lenX > 0) || !(lenY > 0)) return { item, text };
+    const ux = a / lenX;
+    const uy = b / lenX;
+    let lo = 0;
+    let hi = item.width;
+    const span = (n: PageItem): [number, number] | undefined => {
+      const dx = n.transform[4] - e;
+      const dy = n.transform[5] - f;
+      if (Math.abs(-uy * dx + ux * dy) > lenY * 0.5) return undefined; // andere Zeile
+      const t = ux * dx + uy * dy;
+      return [t, t + n.width];
+    };
+    const maxGap = lenY * 1.5;
+    for (let j = idx - 1; j >= 0 && emptied(items[j]); j--) {
+      const s = span(items[j]);
+      if (!s || lo - s[1] > maxGap) break;
+      lo = Math.min(lo, s[0]);
+    }
+    for (let j = idx + 1; j < items.length && emptied(items[j]); j++) {
+      const s = span(items[j]);
+      if (!s || s[0] - hi > maxGap) break;
+      hi = Math.max(hi, s[1]);
+    }
+    if (lo === 0 && hi === item.width) return { item, text };
+    const widened: PageItem = { ...item, transform: [a, b, c, d, e + ux * lo, f + uy * lo], width: hi - lo };
+    return { item: widened, text };
+  });
+}
+
 export type PageEdit =
   | {
       /** 0-basierter Seitenindex */

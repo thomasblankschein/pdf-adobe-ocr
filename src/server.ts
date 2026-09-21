@@ -29,6 +29,7 @@ const LLM_MAX_PAGES = Number(process.env.LLM_MAX_PAGES ?? 50);
 const LLM_CONCURRENCY = Math.max(1, Number(process.env.LLM_CONCURRENCY ?? 3));
 const LLM_IMAGE_MAX_PX = Number(process.env.LLM_IMAGE_MAX_PX ?? 2576);
 const LLM_MAX_BOXES_PER_CALL = Math.max(1, Number(process.env.LLM_MAX_BOXES_PER_CALL ?? 800));
+const LLM_MAX_PASSES = Math.max(1, Math.min(5, Math.floor(Number(process.env.LLM_MAX_PASSES ?? 3)) || 3));
 // Ausweichfall: Seiten mit unbrauchbarer Adobe-Textebene komplett vom Modell transkribieren lassen
 const LLM_TRANSCRIBE = (process.env.LLM_TRANSCRIBE ?? "true").toLowerCase() !== "false";
 
@@ -230,6 +231,7 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
         maxImagePx: LLM_IMAGE_MAX_PX,
         concurrency: LLM_CONCURRENCY,
         maxBoxesPerCall: LLM_MAX_BOXES_PER_CALL,
+        maxPasses: LLM_MAX_PASSES,
         lenient,
         reqId,
       });

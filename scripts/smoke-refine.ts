@@ -11,7 +11,7 @@ import type { Correction, LlmClient, PageImage, RawMeta, TextBox, TranscribedLin
 import { buildDocumentMeta, cleanName, slug, validDate } from "../src/meta";
 import { extractPage, openPdf, type PageItem } from "../src/pdf/pages";
 import { enhanceForReading, isJunkLayer, pageHasInk } from "../src/pdf/quality";
-import { layoutLines, stripTextObjects } from "../src/pdf/textlayer";
+import { buildEntries, layoutLines, stripTextObjects } from "../src/pdf/textlayer";
 import { refinePdf } from "../src/refine";
 
 // --- 1. Tokenizer ---------------------------------------------------------------------------
@@ -356,6 +356,19 @@ async function main() {
   assert.equal(r4.pagesFailed, 2);
   assert.ok(r4.pdf === input);
   assert.ok(r4.meta, "Metadaten trotz Korrekturfehler");
+
+  // Breite: nimmt eine Box den Text geleerter Nachbarn auf, erhält sie deren Gesamtbreite
+  {
+    const mk = (id: number, str: string, e: number, width: number): PageItem => ({ id, str, transform: [10, 0, 0, 10, e, 100], width });
+    const items = [mk(0, "Katja", 10, 40), mk(1, "Tegtme", 55, 35), mk(2, "ier", 92, 15), mk(3, "Weit", 300, 30)];
+    const merged = buildEntries(items, new Map([[1, "Tegtmeier"], [2, ""]]));
+    assert.equal(merged[1].item.transform[4], 55);
+    assert.ok(Math.abs(merged[1].item.width - 52) < 1e-6, "Union aus 'Tegtme' und 'ier'");
+    const far = buildEntries(items, new Map([[0, "Katja Tegtmeier"], [3, ""]]));
+    assert.equal(far[0].item.width, 40, "weit entfernte geleerte Box wird nicht einbezogen");
+    const same = buildEntries(items, new Map([[1, "Tegtm"]]));
+    assert.equal(same[1].item.width, 35, "kürzerer Text ändert die Breite nicht");
+  }
 
   await fallbackScenario();
 
