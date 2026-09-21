@@ -11,7 +11,7 @@ export interface DocumentMeta {
   correspondent: string;
   summary: string;
   confidence: "high" | "medium" | "low";
-  /** Vorgeschlagener relativer Pfad im Ziel, z. B. "Telekom/2026-09-20_Rechnung-Mobilfunk.pdf" */
+  /** Vorgeschlagener relativer Pfad im Ziel, z. B. "Telekom/2026-09-20_Telekom_Rechnung-Mobilfunk.pdf" */
   path: string;
 }
 
@@ -50,9 +50,9 @@ export function validDate(value: string, now = new Date()): string | undefined {
 
 /**
  * Baut aus den Modelldaten den Ablagepfad:
- *   Korrespondent/Datum_Inhalt.pdf            (normal)
- *   _Unbekannt/Datum_Inhalt.pdf               (kein Korrespondent erkannt)
- *   _Pruefen/Datum_Korrespondent_Inhalt.pdf   (Modell unsicher)
+ *   Korrespondent/Datum_Korrespondent_Inhalt.pdf (normal)
+ *   _Unbekannt/Datum_Inhalt.pdf                  (kein Korrespondent erkannt)
+ *   _Pruefen/Datum_Korrespondent_Inhalt.pdf      (Modell unsicher)
  * scanDate (YYYY-MM-DD) ersetzt ein fehlendes Dokumentdatum.
  */
 export function buildDocumentMeta(raw: RawMeta, scanDate?: string, now = new Date()): DocumentMeta {
@@ -74,7 +74,7 @@ export function buildDocumentMeta(raw: RawMeta, scanDate?: string, now = new Dat
     file = `${prefix}_${summary}`;
   } else {
     folder = correspondent;
-    file = `${prefix}_${summary}`;
+    file = `${prefix}_${slug(correspondent, 40)}_${summary}`;
   }
   return { date, dateSource, correspondent, summary, confidence: raw.confidence, path: `${folder}/${file}.pdf` };
 }

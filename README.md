@@ -204,12 +204,12 @@ Mit `meta=true` liest das LLM von der **ersten Seite** (Bild plus bereits korrig
 Der Pfad steht im Antwort-Header `X-OCR-Meta` (Base64 von UTF-8-JSON):
 
 ```json
-{"date":"2026-09-18","dateSource":"document","correspondent":"Telekom","summary":"Rechnung-Mobilfunk","confidence":"high","path":"Telekom/2026-09-18_Rechnung-Mobilfunk.pdf"}
+{"date":"2026-09-18","dateSource":"document","correspondent":"Telekom","summary":"Rechnung-Mobilfunk","confidence":"high","path":"Telekom/2026-09-18_Telekom_Rechnung-Mobilfunk.pdf"}
 ```
 
 | Fall | Pfad |
 |---|---|
-| Normal | `<Korrespondent>/<Datum>_<Kurzinhalt>.pdf` |
+| Normal | `<Korrespondent>/<Datum>_<Korrespondent>_<Kurzinhalt>.pdf` |
 | Kein Korrespondent erkannt | `_Unbekannt/<Datum>_<Kurzinhalt>.pdf` |
 | Modell unsicher (`confidence: low`) | `_Pruefen/<Datum>_<Korrespondent>_<Kurzinhalt>.pdf` |
 | Datum nicht lesbar | `scan_date` (`dateSource: "scan"`), sonst `ohne-Datum` |

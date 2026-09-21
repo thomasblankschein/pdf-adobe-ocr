@@ -51,14 +51,14 @@ import { refinePdf } from "../src/refine";
   assert.equal(validDate("2099-01-01", now), undefined, "zu weit in der Zukunft");
 
   const raw = (o: Partial<RawMeta>): RawMeta => ({ date: "2026-09-20", correspondent: "Telekom", summary: "Rechnung Mobilfunk", confidence: "high", ...o });
-  assert.equal(buildDocumentMeta(raw({}), undefined, now).path, "Telekom/2026-09-20_Rechnung-Mobilfunk.pdf");
+  assert.equal(buildDocumentMeta(raw({}), undefined, now).path, "Telekom/2026-09-20_Telekom_Rechnung-Mobilfunk.pdf");
   assert.equal(buildDocumentMeta(raw({ correspondent: "" }), undefined, now).path, "_Unbekannt/2026-09-20_Rechnung-Mobilfunk.pdf");
   assert.equal(buildDocumentMeta(raw({ confidence: "low" }), undefined, now).path, "_Pruefen/2026-09-20_Telekom_Rechnung-Mobilfunk.pdf");
-  assert.equal(buildDocumentMeta(raw({ confidence: "medium" }), undefined, now).path, "Telekom/2026-09-20_Rechnung-Mobilfunk.pdf", "medium bleibt im Korrespondenten-Ordner");
+  assert.equal(buildDocumentMeta(raw({ confidence: "medium" }), undefined, now).path, "Telekom/2026-09-20_Telekom_Rechnung-Mobilfunk.pdf", "medium bleibt im Korrespondenten-Ordner");
   const noDate = buildDocumentMeta(raw({ date: "" }), "2026-09-19", now);
-  assert.equal(noDate.path, "Telekom/2026-09-19_Rechnung-Mobilfunk.pdf");
+  assert.equal(noDate.path, "Telekom/2026-09-19_Telekom_Rechnung-Mobilfunk.pdf");
   assert.equal(noDate.dateSource, "scan");
-  assert.equal(buildDocumentMeta(raw({ date: "", summary: "" }), undefined, now).path, "Telekom/ohne-Datum_Scan.pdf");
+  assert.equal(buildDocumentMeta(raw({ date: "", summary: "" }), undefined, now).path, "Telekom/ohne-Datum_Telekom_Scan.pdf");
   const evil = buildDocumentMeta(raw({ correspondent: "../../Windows/System32", summary: "a/b\c" }), undefined, now);
   assert.ok(!evil.path.includes("..") && evil.path.split("/").length === 2, "genau eine Ordnerebene: " + evil.path);
   assert.equal(buildDocumentMeta(raw({ correspondent: "CON" }), undefined, now).path.split("/")[0], "_CON");
