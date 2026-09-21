@@ -160,8 +160,8 @@ export async function refinePdf(input: Uint8Array, opts: RefineOptions): Promise
         const text = lines ? lines.map((l) => l.text).join("\n") : pageText(data.items, changed);
         meta = await opts.client.extractMeta(readingImage, text, opts.meta.ownNames);
         // Auf Seiten, die kaum lesbar waren, keine Daten vertrauen: Datum verwerfen, Ablage zur Prüfung
-        if (legibility === "poor") meta = { ...meta, date: "", confidence: "low" };
-        else if (legibility === "partial" && meta.confidence === "high") meta = { ...meta, confidence: "medium" };
+        if (legibility === "poor") meta = { ...meta, date: "", reference: "", confidence: "low" };
+        else if (legibility === "partial") meta = { ...meta, reference: "", confidence: meta.confidence === "high" ? "medium" : meta.confidence };
       } catch (err) {
         metaError = err instanceof Error ? err.message : String(err);
         logger.warn("llm metadaten fehlgeschlagen", { reqId: opts.reqId, err });

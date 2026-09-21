@@ -1,3 +1,4 @@
+import path from "node:path";
 import { createCanvas } from "@napi-rs/canvas";
 import type { PageImage, TextBox } from "../llm/types";
 
@@ -29,7 +30,16 @@ export interface PageData {
 export async function openPdf(bytes: Uint8Array): Promise<{ pdf: PdfDocumentProxy; close: () => Promise<void> }> {
   const pdfjs = await loadPdfJs();
   // Kopie übergeben: pdf.js kann den übergebenen Puffer an den Worker abgeben
-  const task = pdfjs.getDocument({ data: new Uint8Array(bytes), verbosity: 0 });
+  // Ohne wasmUrl kann pdf.js JBIG2-/JPEG2000-Bilder nicht dekodieren: solche Scans würden leer gerendert und das
+  // Modell sähe eine weiße Seite. Die Datenverzeichnisse liegen im Paket (Pfad mit abschließendem Schrägstrich).
+  const dir = (name: string) => path.join(path.dirname(require.resolve("pdfjs-dist/package.json")), name).split(path.sep).join("/") + "/";
+  const task = pdfjs.getDocument({
+    data: new Uint8Array(bytes),
+    verbosity: 0,
+    wasmUrl: dir("wasm"),
+    iccUrl: dir("iccs"),
+    standardFontDataUrl: dir("standard_fonts"),
+  });
   return { pdf: await task.promise, close: () => task.destroy() };
 }
 

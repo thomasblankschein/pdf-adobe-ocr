@@ -10,6 +10,8 @@ export interface DocumentMeta {
   dateSource: "document" | "scan" | "none";
   correspondent: string;
   summary: string;
+  /** Konkreter Bezug (Vertragsnummer, Kennzeichen …) oder leer */
+  reference: string;
   confidence: "high" | "medium" | "low";
   /** Vorgeschlagener relativer Pfad im Ziel, z. B. "Telekom/2026-09-20_Telekom_Rechnung-Mobilfunk.pdf" */
   path: string;
@@ -34,7 +36,11 @@ export function slug(input: string, maxLength: number): string {
     .replace(/[^\p{L}\p{N}_.-]/gu, "")
     .replace(/-{2,}/g, "-")
     .replace(/^[-.]+|[-.]+$/g, "");
-  return t.length > maxLength ? t.slice(0, maxLength).replace(/[-.]+$/, "") : t;
+  if (t.length <= maxLength) return t;
+  // an Wortgrenzen kürzen ("Zusatzversorgungskasse-der-Stadt", nicht "…-Hannove"); ein einziges langes Wort wird hart gekürzt
+  const cut = t.slice(0, maxLength);
+  const byWord = t.charAt(maxLength) === "-" ? cut : cut.replace(/-[^-]*$/, "");
+  return (byWord || cut).replace(/[-.]+$/, "");
 }
 
 /** Gültiges, plausibles Datum (YYYY-MM-DD) oder undefined. */
@@ -50,9 +56,9 @@ export function validDate(value: string, now = new Date()): string | undefined {
 
 /**
  * Baut aus den Modelldaten den Ablagepfad:
- *   Korrespondent/Datum_Korrespondent_Inhalt.pdf (normal)
- *   _Unbekannt/Datum_Inhalt.pdf                  (kein Korrespondent erkannt)
- *   _Pruefen/Datum_Korrespondent_Inhalt.pdf      (Modell unsicher)
+ *   Korrespondent/Datum_Korrespondent_Inhalt[_Bezug].pdf (normal)
+ *   _Unbekannt/Datum_Inhalt[_Bezug].pdf                  (kein Korrespondent erkannt)
+ *   _Pruefen/Datum_Korrespondent_Inhalt[_Bezug].pdf      (Modell unsicher)
  * scanDate (YYYY-MM-DD) ersetzt ein fehlendes Dokumentdatum.
  */
 export function buildDocumentMeta(raw: RawMeta, scanDate?: string, now = new Date()): DocumentMeta {
@@ -62,21 +68,22 @@ export function buildDocumentMeta(raw: RawMeta, scanDate?: string, now = new Dat
   const dateSource = docDate ? "document" : fallback ? "scan" : "none";
   const correspondent = cleanName(raw.correspondent, 50);
   const summary = slug(raw.summary, 60) || "Scan";
+  const reference = slug(raw.reference ?? "", 30);
   const prefix = date || "ohne-Datum";
 
   let folder: string;
   let file: string;
   if (raw.confidence === "low") {
     folder = FOLDER_REVIEW;
-    file = [prefix, slug(correspondent, 40), summary].filter(Boolean).join("_");
+    file = [prefix, slug(correspondent, 40), summary, reference].filter(Boolean).join("_");
   } else if (!correspondent) {
     folder = FOLDER_UNKNOWN;
-    file = `${prefix}_${summary}`;
+    file = [prefix, summary, reference].filter(Boolean).join("_");
   } else {
     folder = correspondent;
-    file = `${prefix}_${slug(correspondent, 40)}_${summary}`;
+    file = [prefix, slug(correspondent, 40), summary, reference].filter(Boolean).join("_");
   }
-  return { date, dateSource, correspondent, summary, confidence: raw.confidence, path: `${folder}/${file}.pdf` };
+  return { date, dateSource, correspondent, summary, reference, confidence: raw.confidence, path: `${folder}/${file}.pdf` };
 }
 
 /** Schreibt Titel, Autor und Datum in die PDF-Eigenschaften (Info-Dictionary). */

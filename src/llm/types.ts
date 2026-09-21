@@ -29,6 +29,8 @@ export interface RawMeta {
   correspondent: string;
   /** Inhalt in höchstens fünf Wörtern */
   summary: string;
+  /** Konkreter Bezug (Vertrags-/Versicherungs-/Depotnummer, Kennzeichen, Fonds); leer/fehlt = keiner erkennbar */
+  reference?: string;
   confidence: "high" | "medium" | "low";
 }
 

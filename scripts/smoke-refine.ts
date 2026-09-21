@@ -41,6 +41,8 @@ import { refinePdf } from "../src/refine";
   assert.ok(cleanName("x".repeat(200), 50).length <= 50);
   assert.equal(slug("Rechnung Mobilfunk, Juli!", 60), "Rechnung-Mobilfunk-Juli");
   assert.equal(slug("Kündigung   Mietvertrag", 60), "Kündigung-Mietvertrag");
+  assert.equal(slug("Zusatzversorgungskasse der Stadt Hannover", 40), "Zusatzversorgungskasse-der-Stadt", "Kürzen an Wortgrenzen");
+  assert.equal(slug("A".repeat(50), 40).length, 40, "einzelnes langes Wort wird hart gekürzt");
   assert.equal(slug("../../etc/passwd", 60), "etc-passwd", "keine Pfadtrenner im Dateinamen");
 
   const now = new Date("2026-09-20T12:00:00Z");
@@ -52,6 +54,10 @@ import { refinePdf } from "../src/refine";
 
   const raw = (o: Partial<RawMeta>): RawMeta => ({ date: "2026-09-20", correspondent: "Telekom", summary: "Rechnung Mobilfunk", confidence: "high", ...o });
   assert.equal(buildDocumentMeta(raw({}), undefined, now).path, "Telekom/2026-09-20_Telekom_Rechnung-Mobilfunk.pdf");
+  assert.equal(buildDocumentMeta(raw({ reference: "LV 12/345-6" }), undefined, now).path, "Telekom/2026-09-20_Telekom_Rechnung-Mobilfunk_LV-12-345-6.pdf", "Bezug am Ende");
+  assert.equal(buildDocumentMeta(raw({ reference: "B-XY 123", confidence: "low" }), undefined, now).path, "_Pruefen/2026-09-20_Telekom_Rechnung-Mobilfunk_B-XY-123.pdf");
+  assert.equal(buildDocumentMeta(raw({ correspondent: "", reference: "4711" }), undefined, now).path, "_Unbekannt/2026-09-20_Rechnung-Mobilfunk_4711.pdf");
+  assert.equal(buildDocumentMeta(raw({ reference: "../../x" }), undefined, now).path.split("/").length, 2, "Bezug ohne Pfadtrenner");
   assert.equal(buildDocumentMeta(raw({ correspondent: "" }), undefined, now).path, "_Unbekannt/2026-09-20_Rechnung-Mobilfunk.pdf");
   assert.equal(buildDocumentMeta(raw({ confidence: "low" }), undefined, now).path, "_Pruefen/2026-09-20_Telekom_Rechnung-Mobilfunk.pdf");
   assert.equal(buildDocumentMeta(raw({ confidence: "medium" }), undefined, now).path, "Telekom/2026-09-20_Telekom_Rechnung-Mobilfunk.pdf", "medium bleibt im Korrespondenten-Ordner");

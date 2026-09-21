@@ -199,23 +199,23 @@ Das Modell darf dabei **nichts raten**, denn der Text landet in einem durchsuchb
 
 ### Dokumentdaten und Ablagevorschlag
 
-Mit `meta=true` liest das LLM von der **ersten Seite** (Bild plus bereits korrigierter Text) drei Angaben: das **Dokumentdatum**, den **Korrespondenten** (Absender, nicht Empfänger – dafür `OWN_NAMES`) und einen **Kurzinhalt** in höchstens fünf Wörtern. Daraus baut der Service einen Ablagepfad. `meta` funktioniert mit und ohne `llm=true`; ohne Korrektur wird der Adobe-Text verwendet.
+Mit `meta=true` liest das LLM von der **ersten Seite** (Bild plus bereits korrigierter Text) vier Angaben: das **Dokumentdatum**, den **Korrespondenten** (Absender, nicht Empfänger – dafür `OWN_NAMES`), einen **Kurzinhalt** in höchstens fünf Wörtern und einen **Bezug** – die Kennung, die das Dokument einem konkreten Vertrag oder Objekt zuordnet (Vertrags-, Versicherungs-, Depot-, Kundennummer, Kfz-Kennzeichen, Fondsname/ISIN; höchstens 30 Zeichen, exakt wie gedruckt, nie geraten, sonst leer). Daraus baut der Service einen Ablagepfad. `meta` funktioniert mit und ohne `llm=true`; ohne Korrektur wird der Adobe-Text verwendet.
 
 Der Pfad steht im Antwort-Header `X-OCR-Meta` (Base64 von UTF-8-JSON):
 
 ```json
-{"date":"2026-09-18","dateSource":"document","correspondent":"Telekom","summary":"Rechnung-Mobilfunk","confidence":"high","path":"Telekom/2026-09-18_Telekom_Rechnung-Mobilfunk.pdf"}
+{"date":"2026-09-18","dateSource":"document","correspondent":"Telekom","summary":"Rechnung-Mobilfunk","reference":"1234567","confidence":"high","path":"Telekom/2026-09-18_Telekom_Rechnung-Mobilfunk_1234567.pdf"}
 ```
 
 | Fall | Pfad |
 |---|---|
-| Normal | `<Korrespondent>/<Datum>_<Korrespondent>_<Kurzinhalt>.pdf` |
-| Kein Korrespondent erkannt | `_Unbekannt/<Datum>_<Kurzinhalt>.pdf` |
-| Modell unsicher (`confidence: low`) | `_Pruefen/<Datum>_<Korrespondent>_<Kurzinhalt>.pdf` |
+| Normal | `<Korrespondent>/<Datum>_<Korrespondent>_<Kurzinhalt>[_<Bezug>].pdf` |
+| Kein Korrespondent erkannt | `_Unbekannt/<Datum>_<Kurzinhalt>[_<Bezug>].pdf` |
+| Modell unsicher (`confidence: low`) | `_Pruefen/<Datum>_<Korrespondent>_<Kurzinhalt>[_<Bezug>].pdf` |
 | Datum nicht lesbar | `scan_date` (`dateSource: "scan"`), sonst `ohne-Datum` |
 | Kein Kurzinhalt | `Scan` |
 
-Namen werden für SMB/Windows bereinigt (keine ` / : * ? " < > |`, keine Punkte oder Leerzeichen am Ende, keine reservierten Namen wie `CON`, begrenzte Länge, Umlaute bleiben); der Pfad hat immer genau **eine** Ordnerebene. Datum und Kurzinhalt werden zusätzlich als Titel, Autor und Erstellungsdatum in die PDF-Eigenschaften geschrieben.
+Der Bezug entfällt, wenn keiner erkennbar ist, und bei schlecht lesbaren Seiten (Ausweichfall) ganz. Namen werden für SMB/Windows bereinigt (keine ` / : * ? " < > |`, keine Punkte oder Leerzeichen am Ende, keine reservierten Namen wie `CON`, begrenzte Länge, Umlaute bleiben); der Pfad hat immer genau **eine** Ordnerebene. Datum und Kurzinhalt werden zusätzlich als Titel, Autor und Erstellungsdatum in die PDF-Eigenschaften geschrieben.
 
 Schlägt nur das Lesen der Dokumentdaten fehl, kommt das PDF trotzdem, aber **ohne** `X-OCR-Meta`; der Aufrufer muss das als „Metadaten fehlen“ behandeln. Beispielaufruf (so ruft ihn der smb1-proxy auf):
 

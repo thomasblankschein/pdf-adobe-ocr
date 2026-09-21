@@ -81,9 +81,10 @@ Extract these fields:
 ${own}
   Use an empty string if the sender cannot be determined.
 - summary: what the document is about, in German, at most five words (for example "Rechnung Mobilfunk", "Kündigung Mietvertrag", "Kontoauszug"). No names or dates unless essential.
+- reference: the ONE identifier that ties the document to a specific contract, account or object, copied exactly as printed and without its label. Prefer, in this order: contract number, policy or insurance number, deposit/securities account or account number, customer number; for vehicle documents the licence plate; for fund or securities statements the fund name or ISIN. At most 30 characters. It must be clearly printed and readable: never guess, complete or combine numbers. Use an empty string if the document has no such identifier or you are not sure of every character.
 - confidence: "high" if date and sender are clearly readable, "medium" if one of them is uncertain, "low" if you had to guess or the page is barely legible.
 
-Answer with JSON only: {"date":"","correspondent":"","summary":"","confidence":"high"}
+Answer with JSON only: {"date":"","correspondent":"","summary":"","reference":"","confidence":"high"}
 
 OCR text of the page:
 ${ocr}`;
@@ -95,9 +96,10 @@ export const META_SCHEMA = {
     date: { type: "string" },
     correspondent: { type: "string" },
     summary: { type: "string" },
+    reference: { type: "string" },
     confidence: { type: "string", enum: ["high", "medium", "low"] },
   },
-  required: ["date", "correspondent", "summary", "confidence"],
+  required: ["date", "correspondent", "summary", "reference", "confidence"],
   additionalProperties: false,
 } as const;
 
@@ -113,7 +115,7 @@ export function parseMeta(raw: string): RawMeta {
   }
   const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
   const confidence = data?.confidence === "high" || data?.confidence === "medium" || data?.confidence === "low" ? data.confidence : "low";
-  return { date: str(data?.date), correspondent: str(data?.correspondent), summary: str(data?.summary), confidence };
+  return { date: str(data?.date), correspondent: str(data?.correspondent), summary: str(data?.summary), reference: str(data?.reference), confidence };
 }
 
 // ---------------------------------------------------------------------------

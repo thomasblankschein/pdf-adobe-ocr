@@ -1,6 +1,6 @@
 {
   "name": "pdf-adobe-ocr",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Gescannte PDFs über die Adobe PDF Services API mit einem OCR-Textlayer versehen",
   "private": true,
   "license": "MIT",
