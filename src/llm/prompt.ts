@@ -9,7 +9,7 @@ export function buildPrompt(boxes: TextBox[]): string {
 Work through ALL boxes, from the first id to the last. Small print in footers, headers, margins and tables needs the same care as the main text, and the last boxes of the page are as important as the first ones.
 
 For every box, look at the matching region of the image and decide what is really printed there.
-- Return an entry only for boxes whose text has to change. Leave out boxes that are already correct.
+- Return one entry for EVERY box, in id order. Read the box region of the image letter by letter and give the text exactly as printed; if the recognised text is already exactly right, repeat it unchanged. Do not skip boxes and do not assume the recognised text is right just because it looks plausible.
 - Give the text exactly as printed: same language, spelling, punctuation, numbers and casing. Do not translate, normalise or comment.
 - If a box contains no readable text (noise, stains, lines, borders), return an empty string for it.
 - The OCR engine often cuts a word or number in the middle and puts the pieces into neighbouring boxes (for example "Be" + "i Fragen", "F" + "ür", "I" + "hr" + "e Stadtwerke", "20," + "21", "m" + "3"). Repair this: move the characters between such boxes so that every word and every number lies completely in ONE box, namely the box where most of it is printed. Return every box whose text changes because of that, and return an empty string for a box that ends up with nothing (for example "Be" -> "Bei" and "i Fragen" -> "Fragen"; "20," -> "20,21" and "21" -> ""). Only move characters between boxes that are directly next to each other on the same line, in reading order; never move text across lines or over larger gaps.

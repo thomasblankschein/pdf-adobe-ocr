@@ -16,7 +16,7 @@ Service und Testseite laufen per `docker compose`; das CLI läuft direkt mit Nod
 
 ## Voraussetzungen
 
-- **Adobe-Zugangsdaten:** In der [Adobe Developer Console](https://developer.adobe.com/console) ein Projekt mit der API **PDF Services** anlegen und die Credentials (Client ID + Client Secret) erzeugen.
+- **Adobe-Zugangsdaten** (nur für `OCR_ENGINE=adobe`, siehe [OCR-Engine](#ocr-engine-adobe-oder-tesseract)): In der [Adobe Developer Console](https://developer.adobe.com/console) ein Projekt mit der API **PDF Services** anlegen und die Credentials (Client ID + Client Secret) erzeugen.
 - Für den Service: Docker mit Compose (Compose v2, `docker compose`).
 - Für CLI und lokale Entwicklung: Node.js ≥ 22.
 
@@ -54,6 +54,15 @@ Alle Einstellungen erfolgen über Umgebungsvariablen (bei Docker über die `.env
 |---|---|---|
 | `PDF_SERVICES_CLIENT_ID` | Adobe Client ID (**Pflicht**) | – |
 | `PDF_SERVICES_CLIENT_SECRET` | Adobe Client Secret (**Pflicht**) | – |
+| `OCR_ENGINE` | `adobe` (Standard) oder `tesseract` (ohne Adobe, siehe [OCR-Engine](#ocr-engine-adobe-oder-tesseract)) | `adobe` |
+| `OCR_FALLBACK` | `tesseract`: bei erschöpftem Adobe-Kontingent (HTTP 429 / `QUOTA_EXCEEDED`) läuft die Anfrage stattdessen mit Tesseract; `none` = kein Ausweichen | `none` |
+| `TESSERACT_LANGS` | Sprachen für Tesseract (z. B. `deu+eng`); leer = Sprache des Requests plus Englisch, soweit installiert | leer |
+| `TESSERACT_DPI` | Auflösung, mit der die Seiten für Tesseract gerendert werden | `300` |
+| `TESSERACT_PSM` | Seitensegmentierung von Tesseract (`3` automatisch, `4` eine Spalte variabler Größe, `11` sparse text) | `3` |
+| `TESSERACT_DESKEW_OUTPUT` | bei `type=deskew` die Seite begradigt ausgeben (`true`) oder nur fürs Erkennen begradigen und das Original behalten (`false`) | `true` |
+| `TESSERACT_JPEG_QUALITY` | JPEG-Qualität (1–100) der begradigten Seiten | `85` |
+| `TESSERACT_DESKEW_MAX` | größte Schräglage in Grad, die bei `type=deskew` ausgeglichen wird | `10` |
+| `TESSERACT_MIN_CONF` | Zeilen unter dieser mittleren Wortsicherheit (0–100) gelten als Rauschen und werden verworfen | `10` |
 | `API_KEY` | schützt `/api/*`; leer = **ungeschützt** (nur in vertrauenswürdigen Netzen!) | leer |
 | `PORT` | Port auf dem Host (im Container lauscht der Service immer auf 3000) | `3000` |
 | `MAX_UPLOAD_MB` | maximale Größe einer hochgeladenen PDF (Adobe-Limit für OCR: 100 MB) | `100` |
@@ -65,7 +74,7 @@ Alle Einstellungen erfolgen über Umgebungsvariablen (bei Docker über die `.env
 | `LLM_IMAGE_MAX_PX` | lange Kante des Seitenbilds, das an das Modell geht (2576 ist die Obergrenze von Claude Sonnet 5; kleinere Schrift braucht Auflösung) | `2576` |
 | `LLM_MAX_PAGES` | Seitenzahl, bis zu der ein Dokument LLM-korrigiert wird (Kostenschutz). Längere Dokumente werden mit `lenient=true` trotzdem per Adobe verarbeitet (ohne Korrektur), sonst mit `400` abgelehnt | `50` |
 | `LLM_TRANSCRIBE` | Ausweichfall bei unbrauchbarer Adobe-Textebene (siehe [unten](#ausweichfall-unbrauchbare-adobe-textebene)); `false` schaltet ihn ab | `true` |
-| `LLM_MAX_BOXES_PER_CALL` | maximale Textboxen pro Modellaufruf; größere Seiten werden aufgeteilt | `800` |
+| `LLM_MAX_BOXES_PER_CALL` | maximale Textboxen pro Modellaufruf; größere Seiten werden aufgeteilt (das Modell liefert je Box einen Eintrag, daher begrenzt dies auch die Antwortlänge) | `250` |
 | `LLM_MAX_PASSES` | Korrekturdurchgänge je Seite (1–5); ein weiterer Durchgang folgt nur, wenn der vorige mindestens 5 Boxen geändert hat (ein Durchgang übersieht bei schlechten Scans einen Teil der Fehler) | `3` |
 | `LLM_TIMEOUT_S` | Timeout je Modellaufruf in Sekunden | `180` |
 | `OWN_NAMES` | Namen, Adressen und Mailadressen des Empfängers, durch `;` getrennt (z. B. `Max Muster; Musterweg 1, 12345 Musterstadt`). Das Modell erkennt damit den Absender statt des Empfängers | leer |
@@ -101,7 +110,7 @@ So lässt sich sofort prüfen, wie gut die Texterkennung bei einem Dokument funk
 |---|---|---|
 | `file` | ja | die PDF-Datei (max. `MAX_UPLOAD_MB`) |
 | `lang` | nein | OCR-Sprache, Standard `de-DE` (Liste über `GET /api/languages`) |
-| `type` | nein | `exact` (Standard): Originalbild bleibt unverändert; `deskew`: Bild wird begradigt |
+| `type` | nein | `exact` (Standard): Originalbild bleibt unverändert; `deskew`: schiefe Seiten werden begradigt (bei Tesseract abschaltbar: `TESSERACT_DESKEW_OUTPUT=false`) |
 | `llm` | nein | LLM-Nachbearbeitung ein/aus: `true` oder `false` (Standard). Anbieter und Modell kommen aus der `.env` (`LLM_PROVIDER`, `LLM_MODEL`) |
 | `meta` | nein | `true`: Datum, Korrespondent und Kurzinhalt von der ersten Seite lesen und einen Ablagepfad vorschlagen (Header `X-OCR-Meta`, siehe [Dokumentdaten](#dokumentdaten-und-ablagevorschlag)). Braucht ein konfiguriertes LLM |
 | `lenient` | nein | `true`: Fehler des LLM brechen die Anfrage nie ab; es kommt immer mindestens das Adobe-Ergebnis (für automatische Abläufe). Dokumente über `LLM_MAX_PAGES` Seiten werden dann nicht abgelehnt, sondern nur ohne LLM-Korrektur verarbeitet (Metadaten von Seite 1 gibt es trotzdem) |
@@ -132,6 +141,21 @@ curl -H "X-API-Key: <key>" http://localhost:3000/api/languages
 | `502` | Fehler bei Adobe (z. B. ungültige Credentials, Kontingent erschöpft, beschädigte PDF) – oder, mit LLM, Fehler des Modellanbieters bei **allen** Seiten (z. B. ungültiger API-Key, unbekanntes Modell) |
 
 Jede Antwort trägt einen Header `X-Request-Id`, mit dem sich der Aufruf im Log wiederfinden lässt.
+
+### OCR-Engine: Adobe oder Tesseract
+
+Die Texterkennung samt Positionen kommt wahlweise von **Adobe PDF Services** (Standard, kostenpflichtig bzw. mit Freikontingent) oder von **Tesseract** (lokal im Container, kostenlos). Der Betreiber wählt in der `.env`; der Request ändert daran nichts. Das Feld `type` gilt für beide Engines (siehe unten).
+
+- **`OCR_ENGINE=adobe`** (Standard): wie bisher.
+- **`OCR_ENGINE=tesseract`**: Adobe-Zugangsdaten sind nicht nötig. Der Service rendert jede Seite (`TESSERACT_DPI`), Tesseract liefert Textzeilen mit Positionen (Wörter mit großem Abstand, z. B. Spalten und Tabellen, werden getrennte Boxen), daraus entsteht die unsichtbare Textebene auf der **unveränderten** Original-PDF. Bereits vorhandene Textebenen der Seiten werden ersetzt.
+- **`type=deskew` bei Tesseract:** Der Service schätzt je Seite die Schräglage (Projektionsprofil, bis `TESSERACT_DESKEW_MAX` Grad, Standard 10) und gibt die Seite **begradigt** aus, wie bei Adobe: Das Bild wird gedreht, die Ränder werden weiß aufgefüllt, die Seitengröße bleibt, die Textebene liegt waagerecht. Die begradigte Seite wird als JPEG eingebettet (`TESSERACT_JPEG_QUALITY`, Standard 85) und ist dadurch meist größer als ein bilevel-Scan. Mit `TESSERACT_DESKEW_OUTPUT=false` wird das Bild nur für die Erkennung begradigt: Das Originalbild bleibt dann unverändert, und die unsichtbare Textebene folgt der Schräglage. Seiten ohne erkennbare Schräglage bleiben in beiden Fällen unberührt. Gemessen an einer um 6° gedrehten Seite: 9 statt 2 von 10 Testwörtern erkannt (3° verkraftet Tesseract auch ohne).
+- **`OCR_FALLBACK=tesseract`** (mit `OCR_ENGINE=adobe`): Meldet Adobe ein erschöpftes Kontingent, läuft die Anfrage automatisch mit Tesseract. Andere Adobe-Fehler (z. B. falsche Credentials) fallen **nicht** zurück. Fehlen die Adobe-Zugangsdaten ganz, laufen alle Anfragen über Tesseract.
+
+Die Antwort trägt `X-OCR-Engine: adobe|tesseract`; nach einem Ausweichen zusätzlich `X-OCR-Engine-Fallback: adobe-quota`.
+
+**Qualität:** Rohes Tesseract liest schlechte Scans deutlich schlechter als Adobe. Das gleicht die [LLM-Nachbearbeitung](#llm-nachbearbeitung) aus: Tesseract liefert die Zeilenrahmen (die Layout-Analyse funktioniert auch bei verwaschenem Text), das Modell liest jede Zeile am Seitenbild nach. An einem verwaschenen Kassenbon behob das Modell so alle bekannten Lesefehler (8 von 8, dreimal hintereinander). Ohne `llm=true` ist die Textebene nur so gut wie Tesseract selbst. Grenzen: gedrehte Seiten (90°/180°) werden von Tesseract nicht automatisch aufgerichtet, und Zeilen, die Tesseract gar nicht findet, kann das Modell nicht ergänzen (Ausweichfall der Transkription bei unbrauchbarer Textebene bleibt).
+
+Das Docker-Image enthält Tesseract mit deutschen und englischen Sprachdaten. Weitere Sprachen: im `Dockerfile` das Paket `tesseract-ocr-data-<code>` ergänzen. Die Kommandozeile (`npm run ocr`) nutzt weiterhin nur Adobe.
 
 ### LLM-Nachbearbeitung
 

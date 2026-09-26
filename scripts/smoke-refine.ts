@@ -5,14 +5,17 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { createCanvas } from "@napi-rs/canvas";
+import { createCanvas, loadImage } from "@napi-rs/canvas";
 import { PDFDocument, StandardFonts } from "pdf-lib";
 import type { Correction, LlmClient, PageImage, RawMeta, TextBox, TranscribedLine, Transcription } from "../src/llm/types";
 import { buildDocumentMeta, cleanName, slug, validDate } from "../src/meta";
+import { detectSkew } from "../src/pdf/deskew";
 import { extractPage, openPdf, type PageItem } from "../src/pdf/pages";
 import { enhanceForReading, isJunkLayer, pageHasInk } from "../src/pdf/quality";
 import { buildEntries, layoutLines, stripTextObjects } from "../src/pdf/textlayer";
 import { refinePdf } from "../src/refine";
+import { engineConfig, isQuotaError } from "../src/engine";
+import { keepLine, ocrWithTesseract, parseTsv, pickLanguages, tesseractCode } from "../src/tesseract";
 
 // --- 1. Tokenizer ---------------------------------------------------------------------------
 {
@@ -374,6 +377,130 @@ async function main() {
     assert.equal(far[0].item.width, 40, "weit entfernte geleerte Box wird nicht einbezogen");
     const same = buildEntries(items, new Map([[1, "Tegtm"]]));
     assert.equal(same[1].item.width, 35, "kürzerer Text ändert die Breite nicht");
+  }
+
+  // Tesseract-Weg (ohne Adobe): TSV-Parser, Sprachwahl, Engine-Konfiguration, Koordinaten der neuen Textebene
+  {
+    const row = (...cols: (string | number)[]) => cols.join("\t");
+    const tsv = [
+      row("level", "page_num", "block_num", "par_num", "line_num", "word_num", "left", "top", "width", "height", "conf", "text"),
+      row(4, 1, 1, 1, 1, 0, 100, 50, 300, 40, -1, ""),
+      row(5, 1, 1, 1, 1, 1, 100, 50, 120, 40, 91.5, "Rechnung"),
+      row(5, 1, 1, 1, 1, 2, 240, 55, 160, 35, 88, "Nr."),
+      row(5, 1, 1, 1, 2, 1, 100, 120, 90, 30, -1, " "),
+      row(5, 1, 1, 1, 2, 2, 200, 120, 90, 30, 12, "~~"),
+    ].join("\n");
+    const parsed = parseTsv(tsv);
+    assert.equal(parsed.length, 2, "zwei Zeilen (Wörter zusammengefasst, leere Wörter verworfen)");
+    const twoColumns = [row(5, 1, 2, 1, 1, 1, 100, 300, 100, 40, 90, "links"), row(5, 1, 2, 1, 1, 2, 700, 300, 100, 40, 90, "rechts")];
+    const cols = parseTsv([tsv, ...twoColumns].join("\n"));
+    assert.deepEqual(cols.slice(2).map((l) => l.text), ["links", "rechts"], "Wörter mit großem Abstand werden getrennte Zeilenstücke");
+    assert.deepEqual([parsed[0].text, parsed[0].x, parsed[0].y, parsed[0].w, parsed[0].h], ["Rechnung Nr.", 100, 50, 300, 40]);
+    assert.ok(keepLine(parsed[0], 10) && !keepLine(parsed[1], 10), "Rauschen ohne Buchstaben/Ziffern fliegt raus");
+    assert.equal(tesseractCode("de-DE"), "deu");
+    assert.equal(pickLanguages("de-DE", ["eng", "deu", "osd"], ""), "deu+eng");
+    assert.equal(pickLanguages("fr-FR", ["eng", "deu"], ""), "eng", "nicht installierte Sprache entfällt");
+    assert.equal(pickLanguages("de-DE", ["eng"], "deu+fra"), "deu+fra", "TESSERACT_LANGS überschreibt");
+
+    assert.deepEqual(engineConfig({}), { engine: "adobe", fallback: undefined });
+    assert.deepEqual(engineConfig({ OCR_ENGINE: "adobe", OCR_FALLBACK: "tesseract" }), { engine: "adobe", fallback: "tesseract" });
+    assert.deepEqual(engineConfig({ OCR_ENGINE: "Tesseract", OCR_FALLBACK: "tesseract" }), { engine: "tesseract", fallback: undefined });
+    assert.throws(() => engineConfig({ OCR_ENGINE: "abbyy" }), /OCR_ENGINE/);
+    assert.throws(() => engineConfig({ OCR_FALLBACK: "x" }), /OCR_FALLBACK/);
+    class ServiceUsageError extends Error {}
+    assert.ok(isQuotaError(new ServiceUsageError("limit")), "Adobe-Nutzungslimit");
+    assert.ok(isQuotaError(Object.assign(new Error("x"), { statusCode: 429 })));
+    assert.ok(!isQuotaError(new Error("Netzwerkfehler")));
+
+    const out = await ocrWithTesseract(input, {
+      locale: "de-DE",
+      recognize: async () => [
+        { text: "Testzeile eins", x: 120, y: 200, w: 800, h: 40, conf: 90 },
+        { text: "~~", x: 10, y: 10, w: 50, h: 40, conf: 90 },
+      ],
+    });
+    const doc = await openPdf(out);
+    for (const n of [1, 2]) {
+      const pg = await extractPage(doc.pdf, n, 800);
+      assert.equal(pg.items.length, 1, `Seite ${n}: eine Zeile, das Rauschen ist weg, alter Text ersetzt`);
+      assert.equal(pg.items[0].str, "Testzeile eins");
+      const b = pg.boxes[0];
+      assert.ok(Math.abs(b.x - 48) <= 3 && Math.abs(b.y - 57) <= 4, `Position stimmt (x=${b.x}, y=${b.y})`);
+      assert.ok(Math.abs(b.w - 323) <= 6, `Breite stimmt (w=${b.w})`);
+    }
+    await doc.close();
+  }
+
+  // Deskew für Tesseract: Schräglage schätzen, Bild begradigen, Zeilen auf die schräge Originalseite zurückrechnen
+  {
+    const skewedPage = (degrees: number) => {
+      const c = createCanvas(1240, 1754);
+      const ctx = c.getContext("2d");
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, 1240, 1754);
+      ctx.translate(620, 877);
+      ctx.rotate((degrees * Math.PI) / 180);
+      ctx.fillStyle = "#000";
+      for (let row = 0; row < 40; row++) {
+        for (let x = -450; x < 450; x += 34) ctx.fillRect(x, -800 + row * 40, 24 + ((row * 7 + x) % 5), 14); // "Wörter"
+      }
+      return c;
+    };
+    const pageCanvas = async (jpeg: Buffer) => {
+      const img = await loadImage(jpeg);
+      const c = createCanvas(img.width, img.height);
+      c.getContext("2d").drawImage(img, 0, 0);
+      return c;
+    };
+    const gray = (c: ReturnType<typeof createCanvas>) => ({ data: c.getContext("2d").getImageData(0, 0, c.width, c.height).data, width: c.width, height: c.height, stride: 4 });
+    for (const deg of [0, 3, -4, 6.5]) {
+      const found = detectSkew(gray(skewedPage(deg)));
+      assert.ok(Math.abs(found - deg) <= 0.4, `Schräglage ${deg}° erkannt (gefunden: ${found}°)`);
+    }
+    assert.equal(detectSkew({ data: new Uint8Array(100 * 100).fill(255), width: 100, height: 100, stride: 1 }), 0, "leere Seite: keine Schräglage");
+
+    const doc2 = await PDFDocument.create();
+    for (const deg of [3, 0]) {
+      const pg2 = doc2.addPage([595, 842]);
+      pg2.drawImage(await doc2.embedPng(await skewedPage(deg).encode("png")), { x: 0, y: 0, width: 595, height: 842 });
+    }
+    const skewedPdf = await doc2.save();
+    let seenSkew = Infinity;
+    const middleLine = async (png: Buffer) => {
+      const img = await loadImage(png);
+      const c = createCanvas(img.width, img.height);
+      c.getContext("2d").drawImage(img, 0, 0);
+      seenSkew = detectSkew(gray(c));
+      return [{ text: "Mitte", x: img.width / 2 - 100, y: img.height / 2 - 20, w: 200, h: 40, conf: 90 }];
+    };
+
+    // begradigte Ausgabe (Standard bei deskew): neues Bild, waagerechte Textzeile, zweite (gerade) Seite unverändert
+    const straight = await ocrWithTesseract(skewedPdf, { locale: "de-DE", deskew: true, recognize: middleLine });
+    const dS = await openPdf(straight);
+    assert.equal(dS.pdf.numPages, 2);
+    const s1 = await extractPage(dS.pdf, 1, 1600);
+    assert.ok(Math.abs(detectSkew(gray(await pageCanvas(s1.image.jpeg)))) <= 0.4, "Ausgabeseite 1 ist begradigt");
+    const angleS = (Math.atan2(s1.items[0].transform[1], s1.items[0].transform[0]) * 180) / Math.PI;
+    assert.ok(Math.abs(angleS) <= 0.05, `Textzeile der begradigten Seite ist waagerecht (${angleS.toFixed(2)}°)`);
+    assert.ok(Math.abs(s1.items[0].transform[4] - 595 / 2) < 60 && Math.abs(s1.items[0].transform[5] - 842 / 2) < 30, "Zeile liegt in der Seitenmitte");
+    assert.equal((await extractPage(dS.pdf, 2, 300)).items.length, 1, "Seite 2 hat ihre Zeile");
+    await dS.close();
+
+    // nur fürs Erkennen begradigen: Original bleibt, Zeile folgt der Schräglage
+    const out2 = await ocrWithTesseract(skewedPdf, {
+      locale: "de-DE",
+      deskew: true,
+      straighten: false,
+      // die Zeile liegt in der Mitte des begradigten Bilds: zurückgerechnet muss sie in der Seitenmitte landen, um 3° geneigt
+      recognize: middleLine,
+    });
+    assert.ok(Math.abs(seenSkew) <= 0.4, `Tesseract bekommt ein begradigtes Bild (Rest: ${seenSkew}°)`);
+    const d2 = await openPdf(out2);
+    const pageItem = (await extractPage(d2.pdf, 1, 800)).items[0];
+    await d2.close();
+    const angle = (Math.atan2(pageItem.transform[1], pageItem.transform[0]) * 180) / Math.PI;
+    assert.ok(Math.abs(angle + 3) <= 0.4, `Textzeile folgt der Schräglage der Originalseite (Winkel ${angle.toFixed(2)}°)`);
+    assert.ok(Math.abs(pageItem.transform[4] - 595 / 2) < 60 && Math.abs(pageItem.transform[5] - 842 / 2) < 30, "Zeile liegt in der Seitenmitte");
   }
 
   await fallbackScenario();

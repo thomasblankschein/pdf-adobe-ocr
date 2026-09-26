@@ -7,6 +7,8 @@ COPY src ./src
 RUN npm run build
 
 FROM node:24-alpine
+# Tesseract für OCR_ENGINE=tesseract bzw. OCR_FALLBACK=tesseract (weitere Sprachen: tesseract-ocr-data-<code>)
+RUN apk add --no-cache tesseract-ocr tesseract-ocr-data-deu tesseract-ocr-data-eng
 ENV NODE_ENV=production PORT=3000
 WORKDIR /app
 COPY package*.json ./

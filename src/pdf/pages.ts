@@ -1,6 +1,7 @@
 import path from "node:path";
 import { createCanvas } from "@napi-rs/canvas";
 import type { PageImage, TextBox } from "../llm/types";
+import { detectSkew } from "./deskew";
 
 // pdf.js ist ein reines ES-Modul; aus dem CommonJS-Build heraus daher per dynamischem import laden.
 type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
@@ -102,6 +103,103 @@ export async function extractPage(
       });
     }
     return { rotation: ((page.rotate % 360) + 360) % 360, image: { jpeg, width, height }, items, boxes };
+  } finally {
+    page.cleanup();
+  }
+}
+
+export interface OcrPage {
+  /** Seitenbild (PNG) für die Texterkennung */
+  png: Buffer;
+  /** erkannte und ausgeglichene Schräglage in Grad (0 = keine) */
+  skew: number;
+  /**
+   * Nur im Modus "straighten" bei erkannter Schräglage: die begradigte Seite als JPEG mit Seitengröße in Punkten.
+   * Sie ersetzt die Originalseite; die Textstücke von toItem beziehen sich dann auf diese (unrotierte) Seite.
+   */
+  straightened?: { jpeg: Buffer; widthPts: number; heightPts: number };
+  /** Rechnet eine erkannte Zeile (Pixel des Bilds) in ein Textstück in PDF-Nutzerkoordinaten um */
+  toItem(line: { x: number; y: number; w: number; h: number }, id: number): PageItem;
+}
+
+export interface OcrRenderOptions {
+  /** > 0: Schräglage bis zu dieser Gradzahl erkennen und ausgleichen */
+  deskewMaxDegrees?: number;
+  /**
+   * false (Standard): nur das Erkennungsbild wird begradigt, Original und Textebene bleiben schräg passend.
+   * true: die Seite wird begradigt ausgegeben (Bild gedreht, Ränder weiß aufgefüllt, Seitengröße bleibt).
+   */
+  straighten?: boolean;
+  /** JPEG-Qualität der begradigten Seite (1-100) */
+  jpegQuality?: number;
+}
+
+/** Rendert eine Seite mit der gewünschten Auflösung für externe Texterkennung (lange Kante höchstens 5000 px). */
+export async function renderPageForOcr(
+  pdf: PdfDocumentProxy,
+  pageNumber: number,
+  dpi: number,
+  options: OcrRenderOptions = {}
+): Promise<OcrPage> {
+  const page = await pdf.getPage(pageNumber);
+  try {
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(dpi / 72, 5000 / Math.max(base.width, base.height));
+    const viewport = page.getViewport({ scale });
+    const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+    await page.render({ canvas: canvas as unknown as HTMLCanvasElement, viewport, background: "white" }).promise;
+
+    const [W, H] = [canvas.width, canvas.height];
+    const maxDeg = options.deskewMaxDegrees ?? 0;
+    const skew =
+      maxDeg > 0 ? detectSkew({ data: canvas.getContext("2d").getImageData(0, 0, W, H).data, width: W, height: H, stride: 4 }, maxDeg) : 0;
+    const rad = (skew * Math.PI) / 180;
+    const [sin, cos] = [Math.sin(rad), Math.cos(rad)];
+    const straighten = skew !== 0 && options.straighten === true;
+
+    let target = canvas;
+    if (skew !== 0) {
+      // um -skew drehen. Nur fürs Erkennen wächst die Zeichenfläche (nichts geht verloren); bei begradigter Ausgabe bleibt die Seitengröße
+      const [W2, H2] = straighten
+        ? [W, H]
+        : [Math.ceil(W * Math.abs(cos) + H * Math.abs(sin)), Math.ceil(W * Math.abs(sin) + H * Math.abs(cos))];
+      target = createCanvas(W2, H2);
+      const ctx = target.getContext("2d");
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, W2, H2);
+      ctx.translate(W2 / 2, H2 / 2);
+      ctx.rotate(-rad);
+      ctx.drawImage(canvas, -W / 2, -H / 2);
+    }
+    const png = await target.encode("png");
+    const straightened = straighten
+      ? { jpeg: await target.encode("jpeg", options.jpegQuality ?? 85), widthPts: W / scale, heightPts: H / scale }
+      : undefined;
+
+    // Bildpunkt des begradigten Erkennungsbilds -> Bildpunkt der Originalseite (Drehung um +skew um die Bildmitte)
+    const back = (x: number, y: number): [number, number] => {
+      if (skew === 0) return [x, y];
+      const [dx, dy] = [x - target.width / 2, y - target.height / 2];
+      return [W / 2 + dx * cos - dy * sin, H / 2 + dx * sin + dy * cos];
+    };
+    // Bildpunkt -> PDF-Punkt: bei begradigter Ausgabe auf der neuen, unrotierten Seite; sonst auf der Originalseite
+    const toPdf = (x: number, y: number): [number, number] =>
+      straightened ? [x / scale, straightened.heightPts - y / scale] : (viewport.convertToPdfPoint(...back(x, y)) as [number, number]);
+    return {
+      png,
+      skew,
+      straightened,
+      toItem(line, id) {
+        // Grundlinie etwa bei 80 % der Zeilenhöhe; die Schriftgröße reicht von dort bis zur Oberkante der Zeile
+        const yBase = line.y + line.h * 0.8;
+        const [x0, y0] = toPdf(line.x, yBase);
+        const [x1, y1] = toPdf(line.x + line.w, yBase);
+        const width = Math.hypot(x1 - x0, y1 - y0) || 1;
+        const [ux, uy] = [(x1 - x0) / width, (y1 - y0) / width];
+        const fontSize = (line.h * 0.8) / scale;
+        return { id, str: "", transform: [ux * fontSize, uy * fontSize, -uy * fontSize, ux * fontSize, x0, y0], width };
+      },
+    };
   } finally {
     page.cleanup();
   }

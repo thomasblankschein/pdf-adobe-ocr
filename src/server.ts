@@ -3,13 +3,14 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pipeline } from "node:stream/promises";
 import express, { type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
 import { PDFDocument } from "pdf-lib";
 import { createLlmClient, llmSetup, type LlmClient } from "./llm";
 import { logger } from "./logger";
-import { createClient, ocrStream } from "./ocr";
+import { engineConfig, runOcr, type EngineConfig } from "./engine";
+import { createClient } from "./ocr";
+import { tesseractVersion } from "./tesseract";
 import { DEFAULT_LANG, DEFAULT_TYPE, parseFlag, parseLocale, parseType, supportedLocales } from "./options";
 import { buildDocumentMeta, ownNames, stampPdfMetadata, validDate, type DocumentMeta } from "./meta";
 import { refinePdf, type RefineResult } from "./refine";
@@ -28,15 +29,29 @@ const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB ?? 100);
 const LLM_MAX_PAGES = Number(process.env.LLM_MAX_PAGES ?? 50);
 const LLM_CONCURRENCY = Math.max(1, Number(process.env.LLM_CONCURRENCY ?? 3));
 const LLM_IMAGE_MAX_PX = Number(process.env.LLM_IMAGE_MAX_PX ?? 2576);
-const LLM_MAX_BOXES_PER_CALL = Math.max(1, Number(process.env.LLM_MAX_BOXES_PER_CALL ?? 800));
+const LLM_MAX_BOXES_PER_CALL = Math.max(1, Number(process.env.LLM_MAX_BOXES_PER_CALL ?? 250));
 const LLM_MAX_PASSES = Math.max(1, Math.min(5, Math.floor(Number(process.env.LLM_MAX_PASSES ?? 3)) || 3));
 // Ausweichfall: Seiten mit unbrauchbarer Adobe-Textebene komplett vom Modell transkribieren lassen
 const LLM_TRANSCRIBE = (process.env.LLM_TRANSCRIBE ?? "true").toLowerCase() !== "false";
 
+// OCR-Engine: Adobe (Standard) oder Tesseract; mit OCR_FALLBACK=tesseract weicht der Service bei erschöpftem Adobe-Kontingent aus
+const ocrConfig: EngineConfig = (() => {
+  try {
+    return engineConfig();
+  } catch (err) {
+    logger.error("start abgebrochen", { err });
+    process.exit(1);
+  }
+})();
 const client = (() => {
+  if (ocrConfig.engine !== "adobe") return undefined;
   try {
     return createClient();
   } catch (err) {
+    if (ocrConfig.fallback) {
+      logger.warn("adobe-zugangsdaten fehlen, alle Anfragen laufen über tesseract", { err });
+      return undefined;
+    }
     logger.error("start abgebrochen", { err });
     process.exit(1);
   }
@@ -120,12 +135,6 @@ function requireLlmClient(): LlmClient {
 }
 
 
-async function readAll(stream: NodeJS.ReadableStream): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) chunks.push(Buffer.from(chunk as Buffer));
-  return Buffer.concat(chunks);
-}
-
 function setPdfHeaders(res: Response, originalName: string) {
   const base = path.basename(originalName, path.extname(originalName)) || "dokument";
   res.setHeader("Content-Type", "application/pdf");
@@ -149,7 +158,7 @@ app.get("/api/llm", requireApiKey, (_req, res) => {
 // POST /api/ocr — multipart/form-data: file (PDF), optional lang, type (exact | deskew),
 //   llm (true | false)   Textboxen per LLM korrigieren
 //   meta (true | false)  Datum, Korrespondent und Kurzinhalt lesen (Header X-OCR-Meta)
-//   lenient (true|false) Modellfehler brechen die Anfrage nicht ab: es kommt immer mindestens das Adobe-Ergebnis
+//   lenient (true|false) Modellfehler brechen die Anfrage nicht ab: es kommt immer mindestens das OCR-Ergebnis
 //   scan_date            YYYY-MM-DD, Ersatz für ein nicht lesbares Dokumentdatum
 app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next) => {
   const file = req.file;
@@ -171,7 +180,7 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       if (scanDate && !validDate(scanDate)) throw new BadRequest('Ungültiger Wert für "scan_date" (YYYY-MM-DD).');
       if (wantCorrect || wantMeta) {
         llm = requireLlmClient();
-        // Vor dem (kostenpflichtigen) Adobe-Aufruf prüfen, ob die Datei lesbar und nicht zu lang ist
+        // Vor dem (kostenpflichtigen) OCR-Aufruf prüfen, ob die Datei lesbar und nicht zu lang ist
         const pages = await PDFDocument.load(await fs.promises.readFile(file.path), { ignoreEncryption: true, updateMetadata: false })
           .then((d) => d.getPageCount())
           .catch(() => {
@@ -201,29 +210,34 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       sizeKb: Math.round(file.size / 1024),
       lang: locale,
       type,
+      engine: ocrConfig.engine,
       llm: llm?.label,
       correct: wantCorrect,
       meta: wantMeta,
       lenient: lenient || undefined,
     });
-    const result = await ocrStream(client, fs.createReadStream(file.path), { locale, type });
+    const ocr = await runOcr(file.path, { config: ocrConfig, adobe: client, locale, type, reqId });
+    const ocrHeaders = () => {
+      res.setHeader("X-OCR-Engine", ocr.engine);
+      if (ocr.fellBack) res.setHeader("X-OCR-Engine-Fallback", "adobe-quota");
+    };
+    logger.info("ocr fertig", { reqId, engine: ocr.engine, fellBack: ocr.fellBack || undefined, ms: Date.now() - t0, bytes: ocr.pdf.length });
 
     if (!llm) {
-      logger.info("ocr adobe fertig", { reqId, ms: Date.now() - t0 });
       setPdfHeaders(res, file.originalname);
+      ocrHeaders();
       if (skippedForLength) res.setHeader("X-OCR-LLM-Skipped", "max-pages");
-      await pipeline(result, res);
-      logger.info("ocr ausgeliefert", { reqId, bytes: res.socket?.bytesWritten, ms: Date.now() - t0 });
+      res.end(Buffer.from(ocr.pdf));
+      logger.info("ocr ausgeliefert", { reqId, bytes: ocr.pdf.length, ms: Date.now() - t0 });
       return;
     }
 
-    // Mit LLM: Adobe-Ergebnis komplett einlesen, Textboxen korrigieren und/oder Dokumentdaten lesen
-    const adobePdf = await readAll(result);
-    logger.info("ocr adobe fertig", { reqId, ms: Date.now() - t0, bytes: adobePdf.length });
+    // Mit LLM: OCR-Ergebnis korrigieren lassen und/oder Dokumentdaten lesen
+    const ocrPdfBytes = ocr.pdf;
     const t1 = Date.now();
     let refined: RefineResult;
     try {
-      refined = await refinePdf(adobePdf, {
+      refined = await refinePdf(ocrPdfBytes, {
         client: llm,
         correct: wantCorrect,
         transcribe: LLM_TRANSCRIBE,
@@ -237,9 +251,9 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       });
     } catch (err) {
       if (!lenient) throw err;
-      // lenient: das Adobe-Ergebnis geht trotzdem raus
-      logger.error("llm fehlgeschlagen, liefere Adobe-Ergebnis", { reqId, err });
-      refined = { pdf: adobePdf, pages: 0, pagesRefined: 0, pagesFailed: 1, corrections: 0, pagesTranscribed: 0, errors: [String(err)] };
+      // lenient: das OCR-Ergebnis geht trotzdem raus
+      logger.error("llm fehlgeschlagen, liefere OCR-Ergebnis ohne LLM", { reqId, err });
+      refined = { pdf: ocrPdfBytes, pages: 0, pagesRefined: 0, pagesFailed: 1, corrections: 0, pagesTranscribed: 0, errors: [String(err)] };
     }
 
     let outPdf = refined.pdf;
@@ -264,6 +278,7 @@ app.post("/api/ocr", requireApiKey, upload.single("file"), async (req, res, next
       ms: Date.now() - t1,
     });
     setPdfHeaders(res, file.originalname);
+    ocrHeaders();
     res.setHeader("X-OCR-LLM", llm.label);
     if (wantCorrect) {
       res.setHeader("X-OCR-LLM-Pages", `${refined.pagesRefined}/${refined.pages}`);
@@ -304,10 +319,21 @@ const server = app.listen(PORT, () => {
   logger.info("service gestartet", {
     port: PORT,
     maxUploadMb: MAX_UPLOAD_MB,
+    engine: ocrConfig.engine,
+    fallback: ocrConfig.fallback ?? "keine",
     apiKey: API_KEY ? "gesetzt" : "nicht gesetzt",
     llm: llm.status === "ready" ? `${llm.provider}/${llm.model}` : "aus",
   });
   if (!API_KEY) logger.warn("API_KEY nicht gesetzt: /api/* ist ungeschützt");
+  if (ocrConfig.engine === "tesseract" || ocrConfig.fallback) {
+    tesseractVersion().then(
+      (v) => logger.info("tesseract verfügbar", { version: v }),
+      (err) => {
+        logger.error("tesseract nicht verfügbar", { err });
+        if (ocrConfig.engine === "tesseract") process.exit(1);
+      }
+    );
+  }
   if (llm.status === "error") logger.error("LLM-Konfiguration fehlerhaft, Nachbearbeitung nicht verfügbar", { reason: llm.reason });
 });
 
