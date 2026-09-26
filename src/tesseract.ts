@@ -191,7 +191,7 @@ async function replaceWithStraightened(input: Uint8Array, pages: Map<number, Non
 export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions): Promise<Uint8Array> {
   const dpi = opts.dpi ?? (Number(process.env.TESSERACT_DPI) || 300);
   const minConf = Number(process.env.TESSERACT_MIN_CONF ?? 10);
-  const deskewMax = Number(process.env.TESSERACT_DESKEW_MAX ?? 10);
+  const deskewMax = Number(process.env.TESSERACT_DESKEW_MAX ?? 30);
   const straighten = opts.deskew === true && (opts.straighten ?? (process.env.TESSERACT_DESKEW_OUTPUT ?? "true").toLowerCase() !== "false");
   const jpegQuality = Number(process.env.TESSERACT_JPEG_QUALITY) || 85;
   const recognize = opts.recognize ?? recognizeWithTesseract;
@@ -211,6 +211,7 @@ export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions
           const page = await renderPageForOcr(pdf, n, dpi, {
             deskewMaxDegrees: opts.deskew ? deskewMax : 0,
             straighten,
+            flatten: process.env.TESSERACT_FLATTEN?.toLowerCase() !== "false",
             jpegQuality,
           });
           if (page.straightened) straightened.set(n - 1, page.straightened);

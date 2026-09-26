@@ -1,4 +1,4 @@
-import { createCanvas, loadImage } from "@napi-rs/canvas";
+import { createCanvas, loadImage, type Canvas } from "@napi-rs/canvas";
 import type { PageItem } from "./pages";
 
 export interface LayerQuality {
@@ -116,4 +116,61 @@ export async function enhanceForReading(jpeg: Buffer): Promise<Buffer> {
   }
   ctx.putImageData(out, 0, 0);
   return canvas.encode("jpeg", 90);
+}
+
+/**
+ * Für die Texterkennung: Papierhintergrund herausrechnen. Farbiges Papier (blaue Kassenbons, vergilbte Blätter)
+ * verleitet die Binarisierung von Tesseract dazu, das Papier als "Tinte" und den Text als Löcher darin zu sehen;
+ * dann findet es keine Wörter. Hier wird die Papierhelligkeit blockweise (90. Perzentil) geschätzt, jeder Punkt
+ * darauf bezogen und so gespreizt, dass Papier weiß und Tinte dunkel wird. Ergebnis ist ein Graustufenbild.
+ */
+export function flattenBackground(source: Canvas): Canvas {
+  const W = source.width;
+  const H = source.height;
+  const src = source.getContext("2d").getImageData(0, 0, W, H).data;
+  const gray = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) gray[i] = 0.299 * src[i * 4] + 0.587 * src[i * 4 + 1] + 0.114 * src[i * 4 + 2];
+
+  const B = Math.max(24, Math.round(Math.max(W, H) / 80));
+  const bw = Math.ceil(W / B);
+  const bh = Math.ceil(H / B);
+  const paper = new Uint8Array(bw * bh);
+  const hist = new Uint32Array(256);
+  for (let by = 0; by < bh; by++) {
+    for (let bx = 0; bx < bw; bx++) {
+      hist.fill(0);
+      let count = 0;
+      for (let y = by * B; y < Math.min(H, (by + 1) * B); y++) {
+        for (let x = bx * B; x < Math.min(W, (bx + 1) * B); x++) {
+          hist[gray[y * W + x]]++;
+          count++;
+        }
+      }
+      let acc = 0;
+      let level = 255;
+      for (let v = 0; v < 256; v++) {
+        acc += hist[v];
+        if (acc >= count * 0.9) {
+          level = v;
+          break;
+        }
+      }
+      paper[by * bw + bx] = Math.max(level, 1);
+    }
+  }
+
+  const out = createCanvas(W, H);
+  const ctx = out.getContext("2d");
+  const img = ctx.createImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const ratio = gray[y * W + x] / paper[Math.floor(y / B) * bw + Math.floor(x / B)];
+      const v = Math.round(255 * Math.min(1, Math.max(0, (ratio - 0.35) / 0.55)));
+      const i = (y * W + x) * 4;
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+      img.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return out;
 }

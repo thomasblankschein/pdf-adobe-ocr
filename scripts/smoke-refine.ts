@@ -11,7 +11,7 @@ import type { Correction, LlmClient, PageImage, RawMeta, TextBox, TranscribedLin
 import { buildDocumentMeta, cleanName, slug, validDate } from "../src/meta";
 import { detectSkew } from "../src/pdf/deskew";
 import { extractPage, openPdf, type PageItem } from "../src/pdf/pages";
-import { enhanceForReading, isJunkLayer, pageHasInk } from "../src/pdf/quality";
+import { enhanceForReading, flattenBackground, isJunkLayer, pageHasInk } from "../src/pdf/quality";
 import { buildEntries, layoutLines, stripTextObjects } from "../src/pdf/textlayer";
 import { refinePdf } from "../src/refine";
 import { engineConfig, isQuotaError } from "../src/engine";
@@ -501,6 +501,30 @@ async function main() {
     const angle = (Math.atan2(pageItem.transform[1], pageItem.transform[0]) * 180) / Math.PI;
     assert.ok(Math.abs(angle + 3) <= 0.4, `Textzeile folgt der Schräglage der Originalseite (Winkel ${angle.toFixed(2)}°)`);
     assert.ok(Math.abs(pageItem.transform[4] - 595 / 2) < 60 && Math.abs(pageItem.transform[5] - 842 / 2) < 30, "Zeile liegt in der Seitenmitte");
+  }
+
+  // Farbiges Papier (blauer Kassenbon): Hintergrund herausrechnen und Schräglage trotz Blattkante finden
+  {
+    const c = createCanvas(1240, 1754);
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, 1240, 1754);
+    ctx.translate(620, 877);
+    ctx.rotate((20 * Math.PI) / 180);
+    ctx.fillStyle = "rgb(110,160,195)"; // blaues Papier
+    ctx.fillRect(-250, -600, 500, 1200);
+    ctx.fillStyle = "#222";
+    for (let row = 0; row < 24; row++) for (let x = -200; x < 200; x += 30) ctx.fillRect(x, -560 + row * 46, 20 + ((row * 5 + x) % 6), 14);
+    const found = detectSkew({ data: c.getContext("2d").getImageData(0, 0, 1240, 1754).data, width: 1240, height: 1754, stride: 4 });
+    assert.ok(Math.abs(found - 20) <= 0.6, `Schräglage auf blauem Papier erkannt (gefunden: ${found}°)`);
+    const flat = flattenBackground(c);
+    const px = flat.getContext("2d").getImageData(0, 0, 1240, 1754).data;
+    const at = (x: number, y: number) => px[(y * 1240 + x) * 4];
+    const [paperX, paperY] = [Math.round(620 + 100 * Math.cos(0.35) - 400 * Math.sin(0.35)), Math.round(877 + 100 * Math.sin(0.35) + 400 * Math.cos(0.35))];
+    assert.ok(at(20, 20) > 240 && at(paperX, paperY) > 200, `Papier (weiß und blau) wird hell (blau: ${at(paperX, paperY)})`);
+    let dark = 0;
+    for (let i = 0; i < px.length; i += 4) if (px[i] < 90) dark++;
+    assert.ok(dark > 2000, `Tinte bleibt dunkel (${dark} Pixel)`);
   }
 
   await fallbackScenario();

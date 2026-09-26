@@ -1,7 +1,8 @@
 import path from "node:path";
 import { createCanvas } from "@napi-rs/canvas";
 import type { PageImage, TextBox } from "../llm/types";
-import { detectSkew } from "./deskew";
+import { measureSkew } from "./deskew";
+import { flattenBackground } from "./quality";
 
 // pdf.js ist ein reines ES-Modul; aus dem CommonJS-Build heraus daher per dynamischem import laden.
 type PdfJs = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
@@ -130,6 +131,8 @@ export interface OcrRenderOptions {
    * true: die Seite wird begradigt ausgegeben (Bild gedreht, Ränder weiß aufgefüllt, Seitengröße bleibt).
    */
   straighten?: boolean;
+  /** Papierhintergrund fürs Erkennungsbild herausrechnen (farbiges Papier); die Ausgabe bleibt unverändert */
+  flatten?: boolean;
   /** JPEG-Qualität der begradigten Seite (1-100) */
   jpegQuality?: number;
 }
@@ -151,18 +154,21 @@ export async function renderPageForOcr(
 
     const [W, H] = [canvas.width, canvas.height];
     const maxDeg = options.deskewMaxDegrees ?? 0;
-    const skew =
-      maxDeg > 0 ? detectSkew({ data: canvas.getContext("2d").getImageData(0, 0, W, H).data, width: W, height: H, stride: 4 }, maxDeg) : 0;
+    const measured =
+      maxDeg > 0 ? measureSkew({ data: canvas.getContext("2d").getImageData(0, 0, W, H).data, width: W, height: H, stride: 4 }, maxDeg) : { degrees: 0 };
+    const skew = measured.degrees;
     const rad = (skew * Math.PI) / 180;
     const [sin, cos] = [Math.sin(rad), Math.cos(rad)];
     const straighten = skew !== 0 && options.straighten === true;
 
     let target = canvas;
     if (skew !== 0) {
-      // um -skew drehen. Nur fürs Erkennen wächst die Zeichenfläche (nichts geht verloren); bei begradigter Ausgabe bleibt die Seitengröße
-      const [W2, H2] = straighten
-        ? [W, H]
-        : [Math.ceil(W * Math.abs(cos) + H * Math.abs(sin)), Math.ceil(W * Math.abs(sin) + H * Math.abs(cos))];
+      // um -skew drehen. Die Zeichenfläche wächst, wenn sonst Tinte abgeschnitten würde (immer beim reinen Erkennungsbild);
+      // passt der gedrehte Inhalt in die Seite, bleibt bei begradigter Ausgabe die Seitengröße
+      const expanded: [number, number] = [Math.ceil(W * Math.abs(cos) + H * Math.abs(sin)), Math.ceil(W * Math.abs(sin) + H * Math.abs(cos))];
+      const b = measured.bounds;
+      const fits = !!b && b.x0 >= 4 && b.x1 <= W - 4 && b.y0 >= 4 && b.y1 <= H - 4;
+      const [W2, H2] = straighten && fits ? [W, H] : expanded;
       target = createCanvas(W2, H2);
       const ctx = target.getContext("2d");
       ctx.fillStyle = "#fff";
@@ -171,9 +177,9 @@ export async function renderPageForOcr(
       ctx.rotate(-rad);
       ctx.drawImage(canvas, -W / 2, -H / 2);
     }
-    const png = await target.encode("png");
+    const png = await (options.flatten ? flattenBackground(target) : target).encode("png");
     const straightened = straighten
-      ? { jpeg: await target.encode("jpeg", options.jpegQuality ?? 85), widthPts: W / scale, heightPts: H / scale }
+      ? { jpeg: await target.encode("jpeg", options.jpegQuality ?? 85), widthPts: target.width / scale, heightPts: target.height / scale }
       : undefined;
 
     // Bildpunkt des begradigten Erkennungsbilds -> Bildpunkt der Originalseite (Drehung um +skew um die Bildmitte)
