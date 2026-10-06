@@ -219,12 +219,48 @@ export function buildEntries(items: PageItem[], texts: Map<number, string>): { i
   });
 }
 
+export interface PageStraighten {
+  /** Drehwinkel in Bogenmaß, mathematisch positiv (PDF-Koordinaten, y nach oben) */
+  angle: number;
+  /** Größe der Ausgabeseite in Punkten */
+  widthPts: number;
+  heightPts: number;
+}
+
+/**
+ * Begradigt eine Seite VERLUSTFREI: Der gesamte vorhandene Seiteninhalt (Scan-Bild) wird in eine Drehmatrix gepackt,
+ * es wird kein Bild neu kodiert (kein JPEG-Verlust, keine Farbunterabtastung, Auflösung und Dateigröße bleiben).
+ * Gedreht wird um die Seitenmitte; die Seite erhält die Größe widthPts x heightPts (Ursprung 0/0).
+ */
+export function rotatePage(doc: PDFDocument, page: PDFPage, st: PageStraighten) {
+  const box = page.getCropBox();
+  const [c, s] = [Math.cos(st.angle), Math.sin(st.angle)];
+  const [cxo, cyo] = [box.x + box.width / 2, box.y + box.height / 2];
+  const [cxn, cyn] = [st.widthPts / 2, st.heightPts / 2];
+  // p' = R (p - Mitte_alt) + Mitte_neu
+  const e = cxn - (c * cxo - s * cyo);
+  const f = cyn - (s * cxo + c * cyo);
+
+  const raw = page.node.get(PDFName.Contents);
+  const existing = raw ? doc.context.lookup(raw) : undefined;
+  const refs: PDFRef[] = existing instanceof PDFArray ? (existing.asArray() as PDFRef[]) : raw instanceof PDFRef ? [raw] : [];
+  const open = doc.context.register(doc.context.stream(["q", `${num(c)} ${num(s)} ${num(-s)} ${num(c)} ${num(e)} ${num(f)} cm`, ""].join("\n")));
+  const close = doc.context.register(doc.context.stream(["", "Q", ""].join("\n")));
+  page.node.set(PDFName.Contents, doc.context.obj([open, ...refs, close]));
+
+  page.setMediaBox(0, 0, st.widthPts, st.heightPts);
+  page.setCropBox(0, 0, st.widthPts, st.heightPts);
+  for (const key of ["TrimBox", "BleedBox", "ArtBox"]) page.node.delete(PDFName.of(key));
+}
+
 export type PageEdit =
   | {
       /** 0-basierter Seitenindex */
       pageIndex: number;
       /** Alle Textstücke der Seite; text = endgültiger Text (leer = Stück entfällt) */
       entries: { item: PageItem; text: string }[];
+      /** Seite vorher verlustfrei begradigen; die Textstücke beziehen sich dann auf die begradigte Seite */
+      straighten?: PageStraighten;
     }
   | {
       pageIndex: number;
@@ -297,6 +333,7 @@ export async function rewriteTextLayers(pdf: Uint8Array, edits: PageEdit[]): Pro
   const pages = doc.getPages();
   for (const edit of edits) {
     const page = pages[edit.pageIndex];
+    if ("entries" in edit && edit.straighten) rotatePage(doc, page, edit.straighten);
     stripPageText(doc, page);
     if ("lines" in edit) addLinesLayer(doc, page, font, edit.lines);
     else addTextLayer(doc, page, font, edit.entries);

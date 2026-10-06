@@ -1,8 +1,7 @@
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { logger } from "./logger";
-import { PDFDocument } from "pdf-lib";
-import { openPdf, renderPageForOcr, type OcrPage } from "./pdf/pages";
+import { openPdf, renderPageForOcr } from "./pdf/pages";
 import { rewriteTextLayers, type PageEdit } from "./pdf/textlayer";
 
 /**
@@ -168,22 +167,6 @@ export interface TesseractOptions {
   recognize?: Recognizer;
 }
 
-/** Ersetzt die angegebenen Seiten durch begradigte Bilder (gleiche Reihenfolge und Seitenzahl); übrige Seiten bleiben unverändert. */
-async function replaceWithStraightened(input: Uint8Array, pages: Map<number, NonNullable<OcrPage["straightened"]>>): Promise<Uint8Array> {
-  const src = await PDFDocument.load(input, { updateMetadata: false });
-  const out = await PDFDocument.create();
-  for (let i = 0; i < src.getPageCount(); i++) {
-    const s = pages.get(i);
-    if (s) {
-      const page = out.addPage([s.widthPts, s.heightPts]);
-      page.drawImage(await out.embedJpg(s.jpeg), { x: 0, y: 0, width: s.widthPts, height: s.heightPts });
-    } else {
-      out.addPage((await out.copyPages(src, [i]))[0]);
-    }
-  }
-  return out.save();
-}
-
 /**
  * Erzeugt aus einer (gescannten) PDF eine PDF mit unsichtbarer Textebene: je Seite rendern, Zeilen erkennen,
  * Positionen in PDF-Koordinaten umrechnen. Vorhandene Textebenen der bearbeiteten Seiten werden ersetzt.
@@ -193,7 +176,6 @@ export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions
   const minConf = Number(process.env.TESSERACT_MIN_CONF ?? 10);
   const deskewMax = Number(process.env.TESSERACT_DESKEW_MAX ?? 30);
   const straighten = opts.deskew === true && (opts.straighten ?? (process.env.TESSERACT_DESKEW_OUTPUT ?? "true").toLowerCase() !== "false");
-  const jpegQuality = Number(process.env.TESSERACT_JPEG_QUALITY) || 85;
   const recognize = opts.recognize ?? recognizeWithTesseract;
   const lang = opts.recognize ? "deu+eng" : pickLanguages(opts.locale, await listLanguages());
   const { pdf, close } = await openPdf(input);
@@ -201,7 +183,7 @@ export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions
   try {
     const total = pdf.numPages;
     const edits: PageEdit[] = new Array(total);
-    const straightened = new Map<number, NonNullable<OcrPage["straightened"]>>();
+    let straightened = 0;
     let next = 1;
     const workers = Math.max(1, Math.min(4, os.availableParallelism(), total));
     await Promise.all(
@@ -212,11 +194,14 @@ export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions
             deskewMaxDegrees: opts.deskew ? deskewMax : 0,
             straighten,
             flatten: process.env.TESSERACT_FLATTEN?.toLowerCase() !== "false",
-            jpegQuality,
           });
-          if (page.straightened) straightened.set(n - 1, page.straightened);
+          if (page.straightened) straightened++;
           const lines = (await recognize(page.png, lang, dpi)).filter((l) => keepLine(l, minConf));
-          edits[n - 1] = { pageIndex: n - 1, entries: lines.map((l, id) => ({ item: page.toItem(l, id), text: l.text })) };
+          edits[n - 1] = {
+            pageIndex: n - 1,
+            entries: lines.map((l, id) => ({ item: page.toItem(l, id), text: l.text })),
+            straighten: page.straightened,
+          };
           logger.debug("tesseract seite fertig", { reqId: opts.reqId, page: n, lines: lines.length, skew: opts.deskew ? page.skew : undefined });
         }
       })
@@ -226,11 +211,10 @@ export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions
       pages: total,
       lang,
       dpi,
-      straightened: straightened.size || undefined,
+      straightened: straightened || undefined,
       ms: Date.now() - t0,
     });
-    const base = straightened.size > 0 ? await replaceWithStraightened(input, straightened) : input;
-    return await rewriteTextLayers(base, edits);
+    return await rewriteTextLayers(input, edits);
   } finally {
     await close();
   }

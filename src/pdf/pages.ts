@@ -115,10 +115,11 @@ export interface OcrPage {
   /** erkannte und ausgeglichene Schräglage in Grad (0 = keine) */
   skew: number;
   /**
-   * Nur im Modus "straighten" bei erkannter Schräglage: die begradigte Seite als JPEG mit Seitengröße in Punkten.
-   * Sie ersetzt die Originalseite; die Textstücke von toItem beziehen sich dann auf diese (unrotierte) Seite.
+   * Nur im Modus "straighten" bei erkannter Schräglage: Angaben, um die Originalseite VERLUSTFREI zu begradigen
+   * (Drehmatrix über dem unveränderten Bild, kein neues Bild). angle in Bogenmaß, mathematisch positiv (PDF, y nach
+   * oben); widthPts/heightPts = Größe der Ausgabeseite. Die Textstücke von toItem beziehen sich dann auf diese Seite.
    */
-  straightened?: { jpeg: Buffer; widthPts: number; heightPts: number };
+  straightened?: { angle: number; widthPts: number; heightPts: number };
   /** Rechnet eine erkannte Zeile (Pixel des Bilds) in ein Textstück in PDF-Nutzerkoordinaten um */
   toItem(line: { x: number; y: number; w: number; h: number }, id: number): PageItem;
 }
@@ -128,13 +129,12 @@ export interface OcrRenderOptions {
   deskewMaxDegrees?: number;
   /**
    * false (Standard): nur das Erkennungsbild wird begradigt, Original und Textebene bleiben schräg passend.
-   * true: die Seite wird begradigt ausgegeben (Bild gedreht, Ränder weiß aufgefüllt, Seitengröße bleibt).
+   * true: die Seite wird begradigt ausgegeben (Originalbild per Drehmatrix gedreht, nicht neu kodiert; Seitengröße bleibt,
+   * wenn der gedrehte Inhalt hineinpasst). Nur bei Seiten ohne /Rotate.
    */
   straighten?: boolean;
   /** Papierhintergrund fürs Erkennungsbild herausrechnen (farbiges Papier); die Ausgabe bleibt unverändert */
   flatten?: boolean;
-  /** JPEG-Qualität der begradigten Seite (1-100) */
-  jpegQuality?: number;
 }
 
 /** Rendert eine Seite mit der gewünschten Auflösung für externe Texterkennung (lange Kante höchstens 5000 px). */
@@ -159,16 +159,19 @@ export async function renderPageForOcr(
     const skew = measured.degrees;
     const rad = (skew * Math.PI) / 180;
     const [sin, cos] = [Math.sin(rad), Math.cos(rad)];
-    const straighten = skew !== 0 && options.straighten === true;
+    // Begradigte Ausgabe nur bei Seiten ohne /Rotate: die Drehmatrix liegt im ungedrehten Seitenkoordinatensystem
+    const straighten = skew !== 0 && options.straighten === true && ((page.rotate % 360) + 360) % 360 === 0;
 
     let target = canvas;
+    let keepsPageSize = false;
     if (skew !== 0) {
       // um -skew drehen. Die Zeichenfläche wächst, wenn sonst Tinte abgeschnitten würde (immer beim reinen Erkennungsbild);
       // passt der gedrehte Inhalt in die Seite, bleibt bei begradigter Ausgabe die Seitengröße
       const expanded: [number, number] = [Math.ceil(W * Math.abs(cos) + H * Math.abs(sin)), Math.ceil(W * Math.abs(sin) + H * Math.abs(cos))];
       const b = measured.bounds;
       const fits = !!b && b.x0 >= 4 && b.x1 <= W - 4 && b.y0 >= 4 && b.y1 <= H - 4;
-      const [W2, H2] = straighten && fits ? [W, H] : expanded;
+      keepsPageSize = straighten && fits;
+      const [W2, H2] = keepsPageSize ? [W, H] : expanded;
       target = createCanvas(W2, H2);
       const ctx = target.getContext("2d");
       ctx.fillStyle = "#fff";
@@ -179,7 +182,11 @@ export async function renderPageForOcr(
     }
     const png = await (options.flatten ? flattenBackground(target) : target).encode("png");
     const straightened = straighten
-      ? { jpeg: await target.encode("jpeg", options.jpegQuality ?? 85), widthPts: target.width / scale, heightPts: target.height / scale }
+      ? {
+          angle: rad,
+          widthPts: keepsPageSize ? base.width : target.width / scale,
+          heightPts: keepsPageSize ? base.height : target.height / scale,
+        }
       : undefined;
 
     // Bildpunkt des begradigten Erkennungsbilds -> Bildpunkt der Originalseite (Drehung um +skew um die Bildmitte)

@@ -6,7 +6,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { createCanvas, loadImage } from "@napi-rs/canvas";
-import { PDFDocument, StandardFonts } from "pdf-lib";
+import crypto from "node:crypto";
+import { PDFDict, PDFDocument, PDFName, StandardFonts } from "pdf-lib";
 import type { Correction, LlmClient, PageImage, RawMeta, TextBox, TranscribedLine, Transcription } from "../src/llm/types";
 import { buildDocumentMeta, cleanName, slug, validDate } from "../src/meta";
 import { detectSkew } from "../src/pdf/deskew";
@@ -485,6 +486,40 @@ async function main() {
     assert.ok(Math.abs(s1.items[0].transform[4] - 595 / 2) < 60 && Math.abs(s1.items[0].transform[5] - 842 / 2) < 30, "Zeile liegt in der Seitenmitte");
     assert.equal((await extractPage(dS.pdf, 2, 300)).items.length, 1, "Seite 2 hat ihre Zeile");
     await dS.close();
+
+    // verlustfrei: der Bildstrom der begradigten Seite ist byte-identisch zum Original (kein neues JPEG), Seitengröße bleibt
+    const imageOf = async (pdf: Uint8Array, pageIndex: number) => {
+      const d = await PDFDocument.load(pdf, { updateMetadata: false });
+      const pg = d.getPages()[pageIndex];
+      const xo = pg.node.Resources()!.lookupMaybe(PDFName.of("XObject"), PDFDict)!;
+      const stream = d.context.lookup(xo.entries()[0][1]) as unknown as { contents: Uint8Array };
+      return { sha: crypto.createHash("sha1").update(stream.contents).digest("hex"), width: pg.getWidth(), height: pg.getHeight() };
+    };
+    const [inImg, outImg] = [await imageOf(skewedPdf, 0), await imageOf(straight, 0)];
+    assert.equal(outImg.sha, inImg.sha, "begradigte Seite behält den Originalbildstrom (verlustfrei)");
+    assert.ok(Math.abs(outImg.width - 595) < 0.01 && Math.abs(outImg.height - 842) < 0.01, `Seitengröße bleibt (${outImg.width}x${outImg.height})`);
+    assert.equal((await imageOf(straight, 1)).sha, (await imageOf(skewedPdf, 1)).sha, "gerade Seite unverändert");
+
+    // Reicht der gedrehte Inhalt nicht mehr auf die Seite (Tinte bis an den Rand), wächst die Seite, damit nichts abgeschnitten wird
+    {
+      const c = createCanvas(1240, 1754);
+      const ctx = c.getContext("2d");
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, 1240, 1754);
+      ctx.translate(620, 877);
+      ctx.rotate((5 * Math.PI) / 180);
+      ctx.fillStyle = "#000";
+      for (let row = 0; row < 46; row++) for (let x = -700; x < 700; x += 34) ctx.fillRect(x, -900 + row * 40, 24 + ((row * 7 + x) % 5), 14);
+      const full = await PDFDocument.create();
+      full.addPage([595, 842]).drawImage(await full.embedPng(await c.encode("png")), { x: 0, y: 0, width: 595, height: 842 });
+      const grown = await ocrWithTesseract(await full.save(), { locale: "de-DE", deskew: true, recognize: middleLine });
+      const g = await imageOf(grown, 0);
+      assert.ok(g.width > 600 && g.height > 850, `Seite wächst bei randfüllender Tinte (${g.width.toFixed(1)}x${g.height.toFixed(1)})`);
+      const dG = await openPdf(grown);
+      const rendered = await pageCanvas((await extractPage(dG.pdf, 1, 1800)).image.jpeg);
+      await dG.close();
+      assert.ok(Math.abs(detectSkew(gray(rendered))) <= 0.6, "auch die vergrößerte Seite ist begradigt");
+    }
 
     // nur fürs Erkennen begradigen: Original bleibt, Zeile folgt der Schräglage
     const out2 = await ocrWithTesseract(skewedPdf, {
