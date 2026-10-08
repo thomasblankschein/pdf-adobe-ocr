@@ -10,6 +10,63 @@ let pdfjsPromise: Promise<PdfJs> | undefined;
 export const loadPdfJs = () => (pdfjsPromise ??= import("pdfjs-dist/legacy/build/pdf.mjs"));
 
 export type PdfDocumentProxy = Awaited<ReturnType<PdfJs["getDocument"]>["promise"]>;
+type PdfPageProxy = Awaited<ReturnType<PdfDocumentProxy["getPage"]>>;
+
+/**
+ * Ab so vielen sichtbar gezeichneten Schriftzeichen gilt eine Seite als "echter" Text (digital erzeugte PDF, z. B. eine
+ * Rechnung): Sie wird weder per OCR noch per LLM angefasst. Ein Scan hat höchstens einen unsichtbaren OCR-Text
+ * (Darstellungsmodus 3) und allenfalls ein paar sichtbare Zeichen (Scanner-Stempel).
+ */
+export const MIN_VISIBLE_CHARS = 20;
+
+// Textdarstellungsmodi (Tr): 0 Füllen, 1 Kontur, 2 beides, 3 unsichtbar, 4-6 wie 0-2 plus Clipping, 7 nur Clipping
+const VISIBLE_RENDER_MODES = new Set([0, 1, 2, 4, 5, 6]);
+
+/** Zählt die Glyphen in den Argumenten eines Textzeige-Operators (Leerzeichen zählen nicht). */
+function countGlyphs(arg: unknown, depth = 0): number {
+  if (Array.isArray(arg)) return depth > 2 ? 0 : arg.reduce((sum: number, a) => sum + countGlyphs(a, depth + 1), 0);
+  if (arg && typeof arg === "object" && "unicode" in arg) {
+    const u = (arg as { unicode?: unknown }).unicode;
+    return typeof u === "string" && u.length > 0 && u.trim() === "" ? 0 : 1;
+  }
+  return 0;
+}
+
+/** Anzahl der auf der Seite SICHTBAR gezeichneten Schriftzeichen (unsichtbarer OCR-Text, Modus 3, zählt nicht). */
+export async function countVisibleChars(page: PdfPageProxy): Promise<number> {
+  const { OPS } = await loadPdfJs();
+  const ops = await page.getOperatorList();
+  const show = new Set<number>([OPS.showText, OPS.showSpacedText, OPS.nextLineShowText, OPS.nextLineSetSpacingShowText]);
+  let mode = 0;
+  const stack: number[] = [];
+  let chars = 0;
+  for (let i = 0; i < ops.fnArray.length; i++) {
+    const fn = ops.fnArray[i];
+    if (fn === OPS.save || fn === OPS.paintFormXObjectBegin) stack.push(mode);
+    else if (fn === OPS.restore || fn === OPS.paintFormXObjectEnd) mode = stack.pop() ?? mode;
+    else if (fn === OPS.setTextRenderingMode) mode = Number(ops.argsArray[i]?.[0]);
+    else if (show.has(fn) && VISIBLE_RENDER_MODES.has(mode)) chars += countGlyphs(ops.argsArray[i]);
+  }
+  return chars;
+}
+
+/** Je Seite: true = Seite enthält echten, sichtbaren Text und bleibt unverändert. Fehler bei einer Seite gelten als "Scan". */
+export async function digitalPages(pdf: PdfDocumentProxy): Promise<boolean[]> {
+  const out: boolean[] = [];
+  for (let n = 1; n <= pdf.numPages; n++) {
+    try {
+      const page = await pdf.getPage(n);
+      try {
+        out.push((await countVisibleChars(page)) >= MIN_VISIBLE_CHARS);
+      } finally {
+        page.cleanup();
+      }
+    } catch {
+      out.push(false);
+    }
+  }
+  return out;
+}
 
 /** Ein von Adobe erzeugtes Textstück inkl. der Rohdaten, die zum Neuschreiben der Textebene nötig sind. */
 export interface PageItem {
@@ -27,6 +84,8 @@ export interface PageData {
   image: PageImage;
   items: PageItem[];
   boxes: TextBox[];
+  /** Sichtbar gezeichnete Schriftzeichen (siehe MIN_VISIBLE_CHARS) */
+  visibleChars: number;
 }
 
 export async function openPdf(bytes: Uint8Array): Promise<{ pdf: PdfDocumentProxy; close: () => Promise<void> }> {
@@ -103,7 +162,8 @@ export async function extractPage(
         h: Math.max(1, Math.round(((Math.max(...ys) - y0) / base.height) * 1000)),
       });
     }
-    return { rotation: ((page.rotate % 360) + 360) % 360, image: { jpeg, width, height }, items, boxes };
+    const visibleChars = await countVisibleChars(page);
+    return { rotation: ((page.rotate % 360) + 360) % 360, image: { jpeg, width, height }, items, boxes, visibleChars };
   } finally {
     page.cleanup();
   }

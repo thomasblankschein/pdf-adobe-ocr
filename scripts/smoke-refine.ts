@@ -13,27 +13,47 @@ import { buildDocumentMeta, cleanName, slug, validDate } from "../src/meta";
 import { detectSkew } from "../src/pdf/deskew";
 import { extractPage, openPdf, type PageItem } from "../src/pdf/pages";
 import { enhanceForReading, flattenBackground, isJunkLayer, pageHasInk } from "../src/pdf/quality";
-import { buildEntries, layoutLines, stripTextObjects } from "../src/pdf/textlayer";
+import { buildEntries, layoutLines, stripInvisibleText } from "../src/pdf/textlayer";
 import { refinePdf } from "../src/refine";
 import { engineConfig, isQuotaError } from "../src/engine";
 import { keepLine, ocrWithTesseract, parseTsv, pickLanguages, tesseractCode } from "../src/tesseract";
 
 // --- 1. Tokenizer ---------------------------------------------------------------------------
 {
-  const strip = (s: string) => stripTextObjects(Buffer.from(s, "latin1")).toString("latin1");
+  const strip = (s: string) => stripInvisibleText(Buffer.from(s, "latin1")).toString("latin1");
   const has = (s: string, needle: string) => s.includes(needle);
 
-  const a = strip("q 1 0 0 1 0 0 cm /Im0 Do Q\nBT /F1 12 Tf (ET inside string) Tj ET\n0 0 m 10 10 l S");
-  assert.ok(!has(a, "BT") && !has(a, "inside") && has(a, "/Im0 Do") && has(a, "10 10 l S"), "Text entfernt, Rest erhalten");
+  // Unsichtbarer Text (Darstellungsmodus 3) wird entfernt, alles andere bleibt
+  const a = strip("q 1 0 0 1 0 0 cm /Im0 Do Q\nBT 3 Tr /F1 12 Tf (ET inside string) Tj ET\n0 0 m 10 10 l S");
+  assert.ok(!has(a, "BT") && !has(a, "inside") && has(a, "/Im0 Do") && has(a, "10 10 l S"), "unsichtbarer Text entfernt, Rest erhalten");
 
-  const b = strip("BT (a \\) ET b) Tj <4554> Tj [(x) -20 (ET)] TJ ET 1 0 0 rg");
+  const b = strip("BT 3 Tr (a \\) ET b) Tj <4554> Tj [(x) -20 (ET)] TJ ET 1 0 0 rg");
   assert.ok(!has(b, "ET") && has(b, "1 0 0 rg"), "Strings mit Escapes/Hex/Arrays");
 
-  const c = strip("q BI /W 2 /H 2 /BPC 8 /CS /G ID BT\nET EI Q BT (t) Tj ET");
+  const c = strip("q BI /W 2 /H 2 /BPC 8 /CS /G ID BT\nET EI Q BT 3 Tr (t) Tj ET");
   assert.ok(has(c, "BI") && has(c, "ID BT\nET EI") && !has(c, "(t)"), "Inline-Bild-Daten bleiben unangetastet");
 
-  const d = strip("% BT im Kommentar\n0 0 m BT (x) Tj");
-  assert.ok(has(d, "% BT im Kommentar") && has(d, "0 0 m") && !has(d, "(x)"), "Kommentar bleibt, offenes Textobjekt wird verworfen");
+  const d = strip("% BT im Kommentar\n0 0 m BT 3 Tr (x) Tj");
+  assert.ok(has(d, "% BT im Kommentar") && has(d, "0 0 m") && !has(d, "(x)"), "Kommentar bleibt, offenes unsichtbares Textobjekt wird verworfen");
+
+  // SICHTBARER Text darf nie entfernt werden (digital erzeugte PDF, z. B. Rechnung)
+  const v1 = strip("BT /F1 12 Tf 72 700 Td (Rechnung Nr. 1) Tj ET");
+  assert.ok(has(v1, "(Rechnung Nr. 1) Tj") && has(v1, "BT") && has(v1, "ET"), "Text ohne Tr ist sichtbar und bleibt");
+  assert.ok(has(strip("BT 0 Tr (a) Tj ET"), "(a) Tj") && has(strip("BT 2 Tr (a) Tj ET"), "(a) Tj"), "Modus 0 und 2 sind sichtbar");
+  assert.ok(!has(strip("BT 7 Tr (a) Tj ET"), "(a)"), "Modus 7 (nur Clipping) ist unsichtbar");
+  assert.ok(has(strip("BT 3 Tr (a) Tj 0 Tr (b) Tj ET"), "(b) Tj"), "ein Objekt, das zwischendurch sichtbar zeichnet, bleibt ganz");
+  assert.ok(has(strip("BT (a) ' ET"), "(a) '"), "Anführungszeichen-Operator zeigt Text");
+  assert.ok(has(strip("BT [(a) -5 (b)] TJ ET"), "TJ"), "TJ ohne Tr ist sichtbar");
+
+  // Modus außerhalb des Textobjekts gesetzt und über q/Q gesichert
+  assert.ok(!has(strip("3 Tr BT (a) Tj ET"), "(a)"), "Tr vor BT: unsichtbar");
+  assert.ok(!has(strip("q 3 Tr BT (a) Tj ET Q"), "(a)"), "Tr innerhalb q: unsichtbar");
+  assert.ok(has(strip("q 3 Tr BT (a) Tj ET Q BT (b) Tj ET"), "(b) Tj"), "nach Q gilt wieder Modus 0: sichtbar");
+  assert.ok(has(strip("BT 3 Tr (a) Tj ET BT (b) Tj ET"), "(b) Tj") === false, "ohne Zurücksetzen bleibt Modus 3 (vererbt): unsichtbar");
+
+  // gemischt: OCR-Ebene weg, sichtbarer Text und Grafik bleiben
+  const m = strip("q 1 0 0 1 0 0 cm /Im0 Do Q BT /F1 10 Tf (Sichtbar) Tj ET q BT 3 Tr (Unsichtbar) Tj ET Q");
+  assert.ok(has(m, "(Sichtbar) Tj") && !has(m, "Unsichtbar") && has(m, "/Im0 Do"), "gemischte Seite: nur die OCR-Ebene verschwindet");
 }
 
 // --- 1b. Dateinamen und Pfade -----------------------------------------------------------------
@@ -560,6 +580,90 @@ async function main() {
     let dark = 0;
     for (let i = 0; i < px.length; i += 4) if (px[i] < 90) dark++;
     assert.ok(dark > 2000, `Tinte bleibt dunkel (${dark} Pixel)`);
+  }
+
+  // Digital erzeugte PDF (sichtbarer Text, kein Scan): bleibt in jedem Schritt unverändert
+  {
+    const digitalDoc = await PDFDocument.create();
+    const helv = await digitalDoc.embedFont(StandardFonts.Helvetica);
+    const dp = digitalDoc.addPage([612, 792]);
+    dp.drawText("Rechnung Nr. S7A7TS6R-0005 vom 08.10.2026", { x: 60, y: 700, size: 14, font: helv });
+    dp.drawText("Anthropic Ireland - Guthabenkauf 100,00 EUR", { x: 60, y: 670, size: 11, font: helv });
+    dp.drawRectangle({ x: 60, y: 600, width: 400, height: 1 });
+    const digitalPdf = await digitalDoc.save();
+
+    // pdf.js erkennt den sichtbaren Text
+    const dd = await openPdf(digitalPdf);
+    const dpage = await extractPage(dd.pdf, 1, 800);
+    assert.ok(dpage.visibleChars >= 60, `sichtbare Zeichen gezählt (${dpage.visibleChars})`);
+    await dd.close();
+
+    // ... und das Scan-PDF des Tests (nur unsichtbarer OCR-Text) zählt als Scan
+    const sd = await openPdf(input);
+    assert.equal((await extractPage(sd.pdf, 1, 800)).visibleChars, 0, "unsichtbarer OCR-Text zählt nicht als sichtbar");
+    await sd.close();
+
+    // LLM-Schritt: keine Korrektur, keine Transkription, PDF unverändert; Dokumentdaten kommen aus dem echten Text
+    calls = 0;
+    transcribeCalls = 0;
+    metaText = "";
+    const digitalRefined = await refinePdf(digitalPdf, { client: stub, correct: true, transcribe: true, meta: { ownNames: ["Thomas Blankschein"] }, maxImagePx: 800, concurrency: 1, maxBoxesPerCall: 800 });
+    assert.equal(calls + transcribeCalls, 0, "kein Korrektur-/Transkriptionsaufruf für eine digitale Seite");
+    assert.equal(digitalRefined.corrections, 0);
+    assert.equal(digitalRefined.pagesRefined, 0);
+    assert.ok(digitalRefined.pdf === digitalPdf, "digitale PDF bleibt byte-identisch");
+    assert.ok(metaText.includes("S7A7TS6R-0005"), "Dokumentdaten werden aus dem sichtbaren Text gelesen");
+
+    // Tesseract-Weg: wird für eine rein digitale PDF gar nicht erst aufgerufen
+    let recognized = 0;
+    const neverCalled = async () => {
+      recognized++;
+      return [];
+    };
+    const tessOut = await ocrWithTesseract(digitalPdf, { locale: "de-DE", deskew: true, recognize: neverCalled });
+    assert.ok(tessOut === digitalPdf && recognized === 0, "Tesseract lässt eine digitale PDF unverändert");
+
+    // runOcr: ohne Adobe-Zugang und ohne Ausweichen trotzdem kein Fehler, weil nichts zu tun ist
+    const { runOcr } = await import("../src/engine");
+    const tmpFile = path.join(process.env.TEMP ?? process.env.TMPDIR ?? ".", `smoke-digital-${process.pid}.pdf`);
+    fs.writeFileSync(tmpFile, digitalPdf);
+    try {
+      const run = await runOcr(tmpFile, {
+        config: { engine: "adobe" },
+        locale: "de-DE" as never,
+        type: "searchable_image_exact" as never,
+      });
+      assert.equal(run.engine, "none", "keine OCR-Engine für eine rein digitale PDF");
+      assert.deepEqual(Buffer.from(run.pdf), Buffer.from(digitalPdf), "PDF kommt unverändert zurück");
+    } finally {
+      fs.rmSync(tmpFile, { force: true });
+    }
+
+    // Gemischtes Dokument: Seite 1 digital, Seite 2 Scan (nur Bild) -> nur Seite 2 bekommt eine Textebene
+    const mixed = await PDFDocument.create();
+    const mfont = await mixed.embedFont(StandardFonts.Helvetica);
+    mixed.addPage([612, 792]).drawText("Digitale Seite mit ausreichend sichtbarem Text darauf", { x: 60, y: 700, size: 12, font: mfont });
+    const scanCanvas = createCanvas(600, 800);
+    const sctx = scanCanvas.getContext("2d");
+    sctx.fillStyle = "#fff";
+    sctx.fillRect(0, 0, 600, 800);
+    sctx.fillStyle = "#000";
+    for (let row = 0; row < 12; row++) sctx.fillRect(60, 80 + row * 40, 380, 14);
+    mixed.addPage([612, 792]).drawImage(await mixed.embedPng(await scanCanvas.encode("png")), { x: 0, y: 0, width: 612, height: 792 });
+    const mixedPdf = await mixed.save();
+    const mixedOut = await ocrWithTesseract(mixedPdf, {
+      locale: "de-DE",
+      recognize: async () => [{ text: "Gescannte Zeile", x: 100, y: 120, w: 400, h: 30, conf: 90 }],
+    });
+    const md = await openPdf(mixedOut);
+    const [p1, p2] = [await extractPage(md.pdf, 1, 800), await extractPage(md.pdf, 2, 800)];
+    await md.close();
+    assert.ok(p1.visibleChars >= 40, "digitale Seite 1 zeichnet ihren Text weiterhin sichtbar");
+    assert.equal(p1.items.length, 1, "Seite 1 hat keine zusätzliche Textebene (nur den eigenen Text)");
+    assert.ok(p1.items[0].str.includes("Digitale Seite"), "Seite 1 behält ihren Originaltext");
+    assert.equal(p2.items.length, 1, "Scan-Seite 2 bekommt ihre Textebene");
+    assert.equal(p2.items[0].str, "Gescannte Zeile");
+    assert.equal(p2.visibleChars, 0, "die neue Textebene ist unsichtbar");
   }
 
   await fallbackScenario();

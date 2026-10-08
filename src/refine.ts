@@ -1,7 +1,7 @@
 import { logger } from "./logger";
 import type { LlmClient, RawMeta, TranscribedLine } from "./llm/types";
 type Legibility = "good" | "partial" | "poor";
-import { extractPage, openPdf, type PageItem } from "./pdf/pages";
+import { extractPage, MIN_VISIBLE_CHARS, openPdf, type PageItem } from "./pdf/pages";
 import { enhanceForReading, isJunkLayer, pageHasInk } from "./pdf/quality";
 import { buildEntries, rewriteTextLayers, type PageEdit } from "./pdf/textlayer";
 
@@ -95,11 +95,16 @@ export async function refinePdf(input: Uint8Array, opts: RefineOptions): Promise
     let legibility: Legibility | undefined;
     let readingImage = data.image; // im Ausweichfall die aufbereitete Fassung
 
+    // Seite mit echtem, sichtbarem Text (digital erzeugte PDF): bleibt unverändert, nichts zu korrigieren oder zu lesen
+    const digital = data.visibleChars >= MIN_VISIBLE_CHARS;
+
     // Ausweichfall: Adobes Textebene ist Müll (oder fehlt trotz Inhalt) -> Seite komplett transkribieren lassen
-    const canTranscribe = opts.transcribe && opts.correct && data.rotation === 0;
+    const canTranscribe = !digital && opts.transcribe && opts.correct && data.rotation === 0;
     const useFallback =
       canTranscribe && (isJunkLayer(data.items) || (data.items.length === 0 && (await pageHasInk(data.image.jpeg))));
-    if (useFallback) {
+    if (digital) {
+      logger.debug("llm seite mit sichtbarem text bleibt unverändert", { reqId: opts.reqId, page: n, visibleChars: data.visibleChars });
+    } else if (useFallback) {
       attempted++;
       try {
         readingImage = { ...data.image, jpeg: await enhanceForReading(data.image.jpeg) };

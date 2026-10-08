@@ -19,9 +19,9 @@ export type LineInput = Pick<TranscribedLine, "text" | "x" | "y">;
 import type { PageItem } from "./pages";
 
 // ---------------------------------------------------------------------------
-// Alte Textebene entfernen: alle Textobjekte (BT … ET) aus den Content-Streams streichen.
-// Die OCR-Ebene von Adobe besteht nur aus unsichtbarem Text neben dem Scan-Bild; Bilder,
-// Pfade und Zustand bleiben unberührt. Der Scanner beachtet Strings, Kommentare und Inline-Bilder,
+// Alte Textebene entfernen: die unsichtbaren Textobjekte (BT … ET im Darstellungsmodus 3) aus den Content-Streams
+// streichen. Die OCR-Ebene von Adobe besteht nur aus unsichtbarem Text neben dem Scan-Bild; Bilder, Pfade, Zustand und
+// SICHTBARER Text bleiben unberührt. Der Scanner beachtet Strings, Kommentare und Inline-Bilder,
 // damit "BT"/"ET" in Daten nicht fälschlich erkannt werden.
 // ---------------------------------------------------------------------------
 
@@ -73,26 +73,53 @@ function findEndOfInlineImage(buf: Buffer, start: number): number {
   return buf.length;
 }
 
-export function stripTextObjects(buf: Buffer): Buffer {
+// Textdarstellungsmodus (Tr): 3 = unsichtbar (OCR-Ebene), 7 = nur Clipping; alle anderen zeichnen sichtbar
+const VISIBLE_TR = new Set([0, 1, 2, 4, 5, 6]);
+const SHOW_OPERATORS = new Set(["Tj", "TJ", "'", '"']);
+
+/**
+ * Entfernt nur UNSICHTBARE Textobjekte (BT … ET, deren Zeichen alle im Darstellungsmodus 3/7 gezeichnet werden):
+ * die alte OCR-Ebene. Sichtbarer Text (digital erzeugte PDF, Beschriftungen) bleibt unangetastet – sonst zerstört das
+ * Neuschreiben der Textebene das Layout. Der Modus wird wie im PDF-Zustand geführt (Tr setzt ihn, q/Q sichern und
+ * stellen ihn wieder her), weil er auch außerhalb des Textobjekts gesetzt werden kann.
+ */
+export function stripInvisibleText(buf: Buffer): Buffer {
   const parts: Buffer[] = [];
   let copyFrom = 0;
   let pos = 0;
+  let mode = 0;
+  const saved: number[] = [];
+  const setMode = (operand: string) => {
+    const m = Number(operand);
+    if (Number.isInteger(m)) mode = m;
+  };
+  let prev = "";
   for (let tok = nextWord(buf, pos); tok; tok = nextWord(buf, pos)) {
     pos = tok.end;
-    if (tok.word === "BT") {
-      let end = buf.length; // nicht abgeschlossenes Textobjekt: Rest verwerfen
+    if (tok.word === "q") saved.push(mode);
+    else if (tok.word === "Q") mode = saved.pop() ?? mode;
+    else if (tok.word === "Tr") setMode(prev);
+    else if (tok.word === "ID") pos = findEndOfInlineImage(buf, pos);
+    else if (tok.word === "BT") {
+      let end = buf.length; // nicht abgeschlossenes Textobjekt: Rest gehört dazu
+      let visible = false;
+      let before = "";
       for (let t = nextWord(buf, pos); t; t = nextWord(buf, pos)) {
         pos = t.end;
         if (t.word === "ET") {
           end = t.end;
           break;
         }
+        if (t.word === "Tr") setMode(before);
+        else if (SHOW_OPERATORS.has(t.word) && VISIBLE_TR.has(mode)) visible = true;
+        before = t.word;
       }
-      parts.push(buf.subarray(copyFrom, tok.start), Buffer.from("\n"));
-      copyFrom = pos = end;
-    } else if (tok.word === "ID") {
-      pos = findEndOfInlineImage(buf, pos);
+      if (!visible) {
+        parts.push(buf.subarray(copyFrom, tok.start), Buffer.from("\n"));
+        copyFrom = pos = end;
+      }
     }
+    prev = tok.word;
   }
   parts.push(buf.subarray(copyFrom));
   return Buffer.concat(parts);
@@ -126,7 +153,7 @@ function stripForms(doc: PDFDocument, resources: PDFDict | undefined, seen: Set<
     const stream = doc.context.lookup(value);
     if (!(stream instanceof PDFStream) || stream.dict.get(PDFName.of("Subtype")) !== FORM) continue;
     const original = decode(stream);
-    const stripped = stripTextObjects(original);
+    const stripped = stripInvisibleText(original);
     if (stripped.length !== original.length) {
       const dict: Record<string, never> = {};
       for (const [k, v] of stream.dict.entries()) {
@@ -143,7 +170,7 @@ function stripPageText(doc: PDFDocument, page: PDFPage) {
   const streams = pageContentStreams(doc, page);
   if (streams.length > 0) {
     const joined = Buffer.concat(streams.flatMap((s) => [decode(s), Buffer.from("\n")]));
-    const ref = doc.context.register(doc.context.flateStream(stripTextObjects(joined)));
+    const ref = doc.context.register(doc.context.flateStream(stripInvisibleText(joined)));
     page.node.set(PDFName.Contents, ref);
   }
   stripForms(doc, page.node.Resources(), new Set());

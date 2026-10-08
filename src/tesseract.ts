@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { logger } from "./logger";
-import { openPdf, renderPageForOcr } from "./pdf/pages";
+import { digitalPages, openPdf, renderPageForOcr } from "./pdf/pages";
 import { rewriteTextLayers, type PageEdit } from "./pdf/textlayer";
 
 /**
@@ -162,6 +162,8 @@ export interface TesseractOptions {
    * Standard: TESSERACT_DESKEW_OUTPUT (true, wenn nicht gesetzt).
    */
   straighten?: boolean;
+  /** Seiten (0-basiert) mit echtem, sichtbarem Text, die unverändert bleiben; fehlt die Angabe, wird sie ermittelt */
+  skipPages?: boolean[];
   reqId?: string;
   /** nur für Tests: ersetzt den Tesseract-Aufruf */
   recognize?: Recognizer;
@@ -169,7 +171,8 @@ export interface TesseractOptions {
 
 /**
  * Erzeugt aus einer (gescannten) PDF eine PDF mit unsichtbarer Textebene: je Seite rendern, Zeilen erkennen,
- * Positionen in PDF-Koordinaten umrechnen. Vorhandene Textebenen der bearbeiteten Seiten werden ersetzt.
+ * Positionen in PDF-Koordinaten umrechnen. Vorhandene (unsichtbare) Textebenen der bearbeiteten Seiten werden ersetzt.
+ * Seiten mit sichtbarem Text (digital erzeugte PDF) bleiben unberührt; sind alle Seiten so, kommt die Eingabe unverändert zurück.
  */
 export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions): Promise<Uint8Array> {
   const dpi = opts.dpi ?? (Number(process.env.TESSERACT_DPI) || 300);
@@ -182,6 +185,7 @@ export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions
   const t0 = Date.now();
   try {
     const total = pdf.numPages;
+    const digital = opts.skipPages ?? (await digitalPages(pdf));
     const edits: PageEdit[] = new Array(total);
     let straightened = 0;
     let next = 1;
@@ -190,6 +194,10 @@ export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions
       Array.from({ length: workers }, async () => {
         while (next <= total) {
           const n = next++;
+          if (digital[n - 1]) {
+            logger.debug("tesseract seite mit sichtbarem text übersprungen", { reqId: opts.reqId, page: n });
+            continue;
+          }
           const page = await renderPageForOcr(pdf, n, dpi, {
             deskewMaxDegrees: opts.deskew ? deskewMax : 0,
             straighten,
@@ -214,7 +222,8 @@ export async function ocrWithTesseract(input: Uint8Array, opts: TesseractOptions
       straightened: straightened || undefined,
       ms: Date.now() - t0,
     });
-    return await rewriteTextLayers(input, edits);
+    const todo = edits.filter(Boolean);
+    return todo.length > 0 ? await rewriteTextLayers(input, todo) : input;
   } finally {
     await close();
   }
